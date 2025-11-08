@@ -1,0 +1,18 @@
+version: "3.8"
+services:
+  app:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - CHAT_MODEL=${CHAT_MODEL:-gpt-4o-mini}
+      - PORT=3000
+      - MAX_ROWS=5000
+      # DB credentials for SQL Server
+      - SQL_USER=${SQL_USER}
+      - SQL_PASS=${SQL_PASS}
+      - SQL_HOST=${SQL_HOST}
+      - SQL_DB=${SQL_DB}
+    volumes:
+      - ./:/app
