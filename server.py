@@ -441,10 +441,11 @@ print("Connecting to SQL Server...")
 
 # Build SQLAlchemy engine URL (keeps your credentials and driver — adjust if necessary)
 # Note: credentials are used inline here (same as your previous code). If you later prefer env vars, swap them.
-username = "devswetha"
-password = "xwnpZgdX"
-host = "cableportalstage.westus2.cloudapp.azure.com"
-database = "bundle_root"
+# prefer environment variables (set locally in .env or in Render UI)
+username = os.getenv("SQL_USER") or os.getenv("SQL_USERNAME") or "devswetha"
+password = os.getenv("SQL_PASSWORD") or os.getenv("SQL_PASS") or "xwnpZgdX"
+host     = os.getenv("SQL_SERVER") or os.getenv("SQL_HOST") or "cableportalstage.westus2.cloudapp.azure.com"
+database = os.getenv("SQL_DATABASE") or os.getenv("SQL_DB") or "bundle_root"
 # driver string must be URL-encoded for spaces; sqlalchemy handles it via + for spaces
 conn_url = (
     f"mssql+pyodbc://{username}:{password}@{host}/{database}"
