@@ -1,7 +1,6 @@
 # Dockerfile — builds Python app + Microsoft ODBC Driver 18 for SQL Server
 FROM python:3.13-slim
 
-# Set noninteractive mode to prevent prompts
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Install system dependencies required for pyodbc & msodbcsql
@@ -16,17 +15,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         locales \
     && rm -rf /var/lib/apt/lists/*
 
-# Add Microsoft repo for ODBC Driver 18 (modern method)
-RUN mkdir -p /etc/apt/keyrings \
- && curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor > /etc/apt/keyrings/microsoft.gpg \
- && curl -fsSL https://packages.microsoft.com/config/debian/12/prod.list \
-      | sed 's#deb https://#deb [signed-by=/etc/apt/keyrings/microsoft.gpg] https://#' \
-      > /etc/apt/sources.list.d/mssql-release.list \
- && apt-get update \
- && ACCEPT_EULA=Y apt-get install -y --no-install-recommends msodbcsql18 \
- && rm -rf /var/lib/apt/lists/*
+# Install Microsoft package signing key and repo (write key into /usr/share/keyrings)
+RUN set -eux; \
+    mkdir -p /usr/share/keyrings; \
+    curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg; \
+    echo "deb [signed-by=/usr/share/keyrings/microsoft-prod.gpg] https://packages.microsoft.com/debian/12/prod bookworm main" \
+      > /etc/apt/sources.list.d/mssql-release.list; \
+    apt-get update; \
+    ACCEPT_EULA=Y apt-get install -y --no-install-recommends msodbcsql18; \
+    rm -rf /var/lib/apt/lists/*
 
-# Create app directory
+# Create app dir
 WORKDIR /app
 
 # Copy project files into container
@@ -39,12 +38,10 @@ RUN python -m pip install --upgrade pip setuptools wheel
 RUN if [ -f requirements.txt ]; then pip install -r requirements.txt; fi && \
     pip install gunicorn
 
-# Set matplotlib cache directory to prevent runtime issues
+# Prevent matplotlib font cache issues at runtime
 ENV MPLCONFIGDIR=/tmp/.matplotlib
 
-# Expose Flask port
 ENV PORT=3000
 EXPOSE 3000
 
-# Run the Flask app via gunicorn
 CMD ["gunicorn", "server:app", "--bind", "0.0.0.0:3000", "--workers", "2"]
