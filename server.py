@@ -441,10 +441,11 @@ print("Connecting to SQL Server...")
 
 # Build SQLAlchemy engine URL (keeps your credentials and driver — adjust if necessary)
 # Note: credentials are used inline here (same as your previous code). If you later prefer env vars, swap them.
-username = "devswetha"
-password = "xwnpZgdX"
-host = "cableportalstage.westus2.cloudapp.azure.com"
-database = "bundle_root"
+# prefer environment variables (set locally in .env or in Render UI)
+username = os.getenv("SQL_USER") or os.getenv("SQL_USERNAME") or "devswetha"
+password = os.getenv("SQL_PASSWORD") or os.getenv("SQL_PASS") or "xwnpZgdX"
+host     = os.getenv("SQL_SERVER") or os.getenv("SQL_HOST") or "cableportalstage.westus2.cloudapp.azure.com"
+database = os.getenv("SQL_DATABASE") or os.getenv("SQL_DB") or "bundle_root"
 # driver string must be URL-encoded for spaces; sqlalchemy handles it via + for spaces
 conn_url = (
     f"mssql+pyodbc://{username}:{password}@{host}/{database}"
@@ -923,19 +924,20 @@ def _ensure_chats_table_and_migration(db_path: Path):
       id TEXT PRIMARY KEY,
       title TEXT,
       created_at INTEGER,
+      session_id TEXT,
       messages_json TEXT
-    If the table exists but messages_json is missing, add it.
+    If the table exists but session_id or messages_json is missing, add them.
     """
     conn = sqlite3.connect(str(db_path))
     try:
         cur = conn.cursor()
-        # create table if missing with minimal columns (without messages_json)
+        # create table if missing with minimal columns (include session_id and messages_json if possible)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS chats (
                 id TEXT PRIMARY KEY,
                 title TEXT,
                 created_at INTEGER
-                -- messages_json column may be added by migration below
+                -- session_id and messages_json may be added by migration below
             );
         """)
         conn.commit()
@@ -944,14 +946,24 @@ def _ensure_chats_table_and_migration(db_path: Path):
         cur.execute("PRAGMA table_info(chats);")
         existing_cols = [r[1] for r in cur.fetchall()]  # r[1] is column name
 
+        # add session_id column if missing
+        if 'session_id' not in existing_cols:
+            try:
+                cur.execute("ALTER TABLE chats ADD COLUMN session_id TEXT;")
+                conn.commit()
+                print("Migration: added 'session_id' column to chats table.")
+            except Exception as e:
+                print("⚠️ Failed to add session_id column during migration:", e)
+
+        # add messages_json column if missing
+        cur.execute("PRAGMA table_info(chats);")
+        existing_cols = [r[1] for r in cur.fetchall()]
         if 'messages_json' not in existing_cols:
             try:
-                # Add messages_json column
                 cur.execute("ALTER TABLE chats ADD COLUMN messages_json TEXT;")
                 conn.commit()
                 print("Migration: added 'messages_json' column to chats table.")
             except Exception as e:
-                # On some SQLite setups ALTER TABLE may fail; log and continue (we'll fallback to JSON file)
                 print("⚠️ Failed to add messages_json column during migration:", e)
 
         # close cursor
@@ -966,8 +978,40 @@ def _ensure_chats_table_and_migration(db_path: Path):
 _ensure_chats_table_and_migration(DB_PATH)
 
 def _row_to_conv(row):
-    """Convert sqlite row (id,title,created_at,messages_json) -> dict as before."""
-    cid, title, created_at, messages_json = row
+    """Convert sqlite row (id,title,created_at,session_id,messages_json) -> dict as before."""
+    # row may vary depending on schema/order; handle flexibly
+    try:
+        # If row is tuple of 4 or 5 items, attempt to map accordingly
+        if len(row) == 4:
+            cid, title, created_at, messages_json = row
+            session_id = ""
+        elif len(row) == 5:
+            cid, title, created_at, session_id, messages_json = row
+        else:
+            # fallback: try indexing by known names if row is sqlite3.Row (mapping)
+            try:
+                cid = row['id']
+                title = row.get('title')
+                created_at = row.get('created_at', 0)
+                session_id = row.get('session_id', '')
+                messages_json = row.get('messages_json', '')
+            except Exception:
+                # ultimate fallback
+                cid = row[0]
+                title = row[1] if len(row) > 1 else None
+                created_at = row[2] if len(row) > 2 else 0
+                session_id = row[3] if len(row) > 3 else ''
+                messages_json = row[4] if len(row) > 4 else ''
+    except Exception:
+        # safe defaults on any unexpected shape
+        try:
+            cid = row[0]
+        except Exception:
+            cid = "unknown"
+        title = ""
+        created_at = 0
+        session_id = ""
+        messages_json = ""
     try:
         messages = json.loads(messages_json) if messages_json else []
     except Exception:
@@ -976,6 +1020,7 @@ def _row_to_conv(row):
         "id": cid,
         "title": title,
         "created_at": created_at or 0,
+        "session_id": session_id,
         "messages": messages
     }
 
@@ -983,14 +1028,22 @@ def _load_conversations():
     """Return all saved chats as a dict."""
     try:
         with sqlite3.connect(str(DB_PATH)) as conn:
-            rows = conn.execute("SELECT id, title, created_at, messages_json FROM chats ORDER BY created_at DESC").fetchall()
+            cur = conn.cursor()
+            # attempt to select including messages_json and session_id
+            try:
+                rows = cur.execute("SELECT id, title, created_at, session_id, messages_json FROM chats ORDER BY created_at DESC").fetchall()
+            except Exception:
+                # fallback if schema older
+                rows = cur.execute("SELECT id, title, created_at, messages_json FROM chats ORDER BY created_at DESC").fetchall()
         out = {}
         for r in rows:
-            out[r[0]] = {
-                "id": r[0],
-                "title": r[1],
-                "created_at": r[2],
-                "messages": json.loads(r[3]) if r[3] else []
+            # use helper to parse row flexibly
+            conv = _row_to_conv(r)
+            out[conv['id']] = {
+                "id": conv['id'],
+                "title": conv.get("title") or "Chat",
+                "created_at": conv.get("created_at", 0),
+                "messages": conv.get("messages", [])
             }
         return out
     except Exception as e:
@@ -1003,17 +1056,32 @@ def _load_conversations():
             print("⚠️ Fallback JSON load failed:", ex)
         return {}
 
-def _save_conversation_single(chat_id, title, created_at, messages):
+def _save_conversation_single(chat_id, title, created_at, messages, session_id=""):
     """Save or update a single chat record (tries SQLite first, then fallback JSON)."""
     # ensure migration ran before we attempt to save (defensive)
     _ensure_chats_table_and_migration(DB_PATH)
 
     try:
         with sqlite3.connect(str(DB_PATH)) as conn:
-            conn.execute(
-                "INSERT OR REPLACE INTO chats (id, title, created_at, messages_json) VALUES (?, ?, ?, ?)",
-                (chat_id, title, created_at, json.dumps(messages))
-            )
+            # use INSERT OR REPLACE: make sure the table supports session_id and messages_json
+            cur = conn.cursor()
+            # ensure columns exist
+            cur.execute("PRAGMA table_info(chats);")
+            existing_cols = [r[1] for r in cur.fetchall()]
+            if 'session_id' in existing_cols and 'messages_json' in existing_cols:
+                cur.execute(
+                    "INSERT OR REPLACE INTO chats (id, title, created_at, session_id, messages_json) VALUES (?, ?, ?, ?, ?)",
+                    (chat_id, title, created_at, session_id, json.dumps(messages))
+                )
+            elif 'messages_json' in existing_cols:
+                # older schema without session_id
+                cur.execute(
+                    "INSERT OR REPLACE INTO chats (id, title, created_at, messages_json) VALUES (?, ?, ?, ?)",
+                    (chat_id, title, created_at, json.dumps(messages))
+                )
+            else:
+                # minimal schema (very old) - try to store messages in JSON file instead
+                raise RuntimeError("SQLite schema missing messages_json column")
             conn.commit()
         return True
     except Exception as e:
@@ -1026,10 +1094,13 @@ def _save_conversation_single(chat_id, title, created_at, messages):
                     all_conv = json.load(open(MEMORY_FILE, 'r', encoding='utf8'))
                 except Exception:
                     all_conv = {}
+            # use session_id in JSON structure nested per-session for compatibility
+            # previous format stored flat dict by id; to avoid breaking older clients, keep flat structure but embed session_id
             all_conv[chat_id] = {
                 "id": chat_id,
                 "title": title,
                 "created_at": created_at,
+                "session_id": session_id,
                 "messages": messages
             }
             with open(MEMORY_FILE, 'w', encoding='utf8') as f:
@@ -1046,12 +1117,24 @@ def _save_conversation_single(chat_id, title, created_at, messages):
 
 @app.route('/memory/list', methods=['GET'])
 def memory_list():
-    """List saved chat sessions (for sidebar)"""
+    """List saved chat sessions (for sidebar). Supports optional 'sid' query param to scope chats per-session."""
+    sid = (request.args.get('sid') or "").strip()
     try:
         with sqlite3.connect(str(DB_PATH)) as conn:
-            rows = conn.execute(
-                "SELECT id, title, created_at FROM chats ORDER BY created_at DESC"
-            ).fetchall()
+            cur = conn.cursor()
+            # determine if session_id column exists
+            cur.execute("PRAGMA table_info(chats);")
+            cols = [r[1] for r in cur.fetchall()]
+            if sid and 'session_id' in cols:
+                rows = cur.execute(
+                    "SELECT id, title, created_at FROM chats WHERE session_id = ? ORDER BY created_at DESC",
+                    (sid,)
+                ).fetchall()
+            else:
+                # if no sid provided or no session column, list all (backwards compatible)
+                rows = cur.execute(
+                    "SELECT id, title, created_at FROM chats ORDER BY created_at DESC"
+                ).fetchall()
         chats = [
             {"id": r[0], "title": r[1] or "Chat", "created_at": r[2]}
             for r in rows
@@ -1063,6 +1146,10 @@ def memory_list():
             conv = _load_conversations()
             items = []
             for k, v in conv.items():
+                # if sid provided, filter by session_id field stored in JSON
+                if sid:
+                    if isinstance(v, dict) and v.get("session_id") and v.get("session_id") != sid:
+                        continue
                 items.append({"id": k, "title": v.get("title") or "Chat", "created_at": v.get("created_at", 0)})
             items.sort(key=lambda x: x['created_at'] or 0, reverse=True)
             return jsonify({"chats": items})
@@ -1071,55 +1158,86 @@ def memory_list():
 
 @app.route('/memory/load', methods=['GET'])
 def memory_load():
-    """Load a specific chat by ID"""
+    """Load a specific chat by ID. Optional query param 'sid' will restrict to that session's data."""
     cid = (request.args.get('id') or "").strip()
+    sid = (request.args.get('sid') or "").strip()
     if not cid:
         return jsonify({"error": "Missing chat ID"}), 400
     try:
         with sqlite3.connect(str(DB_PATH)) as conn:
-            row = conn.execute(
-                "SELECT id, title, created_at, messages_json FROM chats WHERE id = ?",
-                (cid,)
-            ).fetchone()
+            cur = conn.cursor()
+            # check schema to know whether session_id exists
+            cur.execute("PRAGMA table_info(chats);")
+            cols = [r[1] for r in cur.fetchall()]
+            if sid and 'session_id' in cols:
+                row = cur.execute(
+                    "SELECT id, title, created_at, session_id, messages_json FROM chats WHERE id = ? AND session_id = ?",
+                    (cid, sid)
+                ).fetchone()
+            else:
+                row = cur.execute(
+                    "SELECT id, title, created_at, messages_json FROM chats WHERE id = ?",
+                    (cid,)
+                ).fetchone()
         if not row:
             # fallback to JSON
             conv = _load_conversations()
             conv_row = conv.get(cid)
             if conv_row:
+                # if sid provided and conv_row has session_id, enforce it
+                if sid and conv_row.get("session_id") and conv_row.get("session_id") != sid:
+                    return jsonify({"error": "Chat not found"}), 404
                 return jsonify(conv_row)
             return jsonify({"error": "Chat not found"}), 404
+        # build response based on row shape
+        # row could be 4 or 5 columns depending on schema; helper handles it
+        conv = _row_to_conv(row)
+        # If sid is provided and stored session_id doesn't match, return not found
+        if sid and conv.get("session_id") and conv.get("session_id") != sid:
+            return jsonify({"error": "Chat not found"}), 404
         return jsonify({
-            "id": row[0],
-            "title": row[1],
-            "created_at": row[2],
-            "messages": json.loads(row[3]) if row[3] else []
+            "id": conv["id"],
+            "title": conv.get("title") or "Chat",
+            "created_at": conv.get("created_at", 0),
+            "messages": conv.get("messages", [])
         })
     except Exception as e:
         return jsonify({"error": f"Failed to load chat: {e}"}), 500
 
 @app.route('/memory/save', methods=['POST'])
 def memory_save():
-    """Save or update a conversation"""
+    """Save or update a conversation. Accepts 'sid' in payload to scope the chat to a session (per-visitor)."""
     payload = request.get_json(force=True) or {}
     cid = payload.get('id') or f"chat-{int(time.time() * 1000)}"
     title = payload.get('title') or 'Chat'
     created_at = payload.get('created_at') or int(time.time() * 1000)
     messages = payload.get('messages') or []
-    ok = _save_conversation_single(cid, title, created_at, messages)
+    sid = payload.get('sid') or ""  # session id provided by client (optional)
+
+    ok = _save_conversation_single(cid, title, created_at, messages, session_id=sid)
     if not ok:
         return jsonify({"error": "Failed to save chat"}), 500
     return jsonify({"ok": True, "id": cid})
 
 @app.route('/memory/delete', methods=['POST'])
 def memory_delete():
-    """Delete a chat by ID"""
+    """Delete a chat by ID. If payload contains 'sid', deletion will only remove the chat for that session."""
     payload = request.get_json(force=True) or {}
     cid = payload.get('id')
+    sid = payload.get('sid') or ""
     if not cid:
         return jsonify({"error": "Missing chat ID"}), 400
     try:
         with sqlite3.connect(str(DB_PATH)) as conn:
-            conn.execute("DELETE FROM chats WHERE id = ?", (cid,))
+            cur = conn.cursor()
+            # check if session_id column exists
+            cur.execute("PRAGMA table_info(chats);")
+            cols = [r[1] for r in cur.fetchall()]
+            if sid and 'session_id' in cols:
+                cur.execute("DELETE FROM chats WHERE id = ? AND session_id = ?", (cid, sid))
+            else:
+                # fallback: delete by id regardless of session (backwards compatible)
+                cur.execute("DELETE FROM chats WHERE id = ?", (cid,))
             conn.commit()
         return jsonify({"ok": True})
     except Exception as e:
@@ -1128,6 +1246,9 @@ def memory_delete():
             if MEMORY_FILE.exists():
                 m = json.load(open(MEMORY_FILE, 'r', encoding='utf8'))
                 if cid in m:
+                    # if sid provided, verify session match before deleting
+                    if sid and m[cid].get("session_id") and m[cid].get("session_id") != sid:
+                        return jsonify({"error": "Chat not found"}), 404
                     m.pop(cid, None)
                     with open(MEMORY_FILE, 'w', encoding='utf8') as f:
                         json.dump(m, f, ensure_ascii=False, indent=2)
