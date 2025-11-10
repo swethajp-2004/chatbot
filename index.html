@@ -152,6 +152,36 @@
   function escapeHtml(s){ return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 
   // -------------------------
+  // per-visitor session id (cookie) — ADDED: do not remove
+  // -------------------------
+  function uuidv4() {
+    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+      const r = Math.random() * 16 | 0, v = c === 'x' ? r : (r & 0x3 | 0x8);
+      return v.toString(16);
+    });
+  }
+  function getCookie(name) {
+    const m = document.cookie.match(new RegExp('(^| )' + name + '=([^;]+)'));
+    return m ? decodeURIComponent(m[2]) : null;
+  }
+  function setCookie(name, value, days=365) {
+    const d = new Date(); d.setTime(d.getTime() + (days*24*60*60*1000));
+    document.cookie = `${name}=${encodeURIComponent(value)};path=/;expires=${d.toUTCString()}`;
+  }
+  function getSessionId() {
+    let sid = getCookie('session_id');
+    if (!sid) {
+      sid = uuidv4();
+      setCookie('session_id', sid, 365);
+    }
+    return sid;
+  }
+  const SESSION_ID = getSessionId();
+  // -------------------------
+  // End session id code
+  // -------------------------
+
+  // -------------------------
   // Helper to set header title (keeps the top bar in sync)
   // -------------------------
   function setTopHeaderTitle(title){
@@ -273,7 +303,7 @@
   // load list from server
   async function loadChatsIndex(){
     try {
-      const res = await fetch('/memory/list');
+      const res = await fetch('/memory/list?sid=' + encodeURIComponent(SESSION_ID));
       const j = await res.json();
       if(j && Array.isArray(j.chats)){
         chatsIndex = {};
@@ -312,7 +342,7 @@
 
   async function loadConversation(id){
     try {
-      const res = await fetch('/memory/load?id=' + encodeURIComponent(id));
+      const res = await fetch('/memory/load?id=' + encodeURIComponent(id) + '&sid=' + encodeURIComponent(SESSION_ID));
       if(res.status===200){
         const j = await res.json();
         currentChatId = id;
@@ -333,6 +363,7 @@
 
   async function saveConversationToServer(id){
     const payload = {
+      sid: SESSION_ID,
       id,
       title: (chatsIndex[id] && chatsIndex[id].title) || 'Chat',
       created_at: (chatsIndex[id] && chatsIndex[id].created_at) || Date.now(),
@@ -353,7 +384,7 @@
     if(!confirm('Delete this chat? This cannot be undone from the UI.')) return;
     try {
       const res = await fetch('/memory/delete', {
-        method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ id })
+        method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ id, sid: SESSION_ID })
       });
       const j = await res.json();
       if(j && j.ok){
