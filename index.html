@@ -166,7 +166,8 @@
   }
   function setCookie(name, value, days=365) {
     const d = new Date(); d.setTime(d.getTime() + (days*24*60*60*1000));
-    document.cookie = `${name}=${encodeURIComponent(value)};path=/;expires=${d.toUTCString()}`;
+    // More strict cookie attributes to avoid accidental sharing across sites.
+    document.cookie = `${name}=${encodeURIComponent(value)};path=/;expires=${d.toUTCString()};SameSite=Strict`;
   }
   function getSessionId() {
     let sid = getCookie('session_id');
@@ -303,6 +304,18 @@
   // load list from server
   async function loadChatsIndex(){
     try {
+      // We use a simple "seen" cookie to distinguish first-time visitors from returning visitors.
+      // Requirement: first-time visitor should NOT see anyone else's chats; they see a fresh new chat.
+      const seen = getCookie('bundle_seen_before');
+      if (!seen) {
+        // mark as seen for future visits
+        setCookie('bundle_seen_before', '1', 365);
+        // create a brand new chat for this visitor and do not preload server chat list
+        await createNewChat();
+        return;
+      }
+
+      // For returning visitors, fetch server-side chats for this SESSION_ID
       const res = await fetch('/memory/list?sid=' + encodeURIComponent(SESSION_ID));
       const j = await res.json();
       if(j && Array.isArray(j.chats)){
