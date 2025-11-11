@@ -501,10 +501,11 @@
     typingDiv.scrollIntoView({behavior:'smooth'});
 
     try {
+      // NOTE: include session id and chat id in /chat payload so server can associate responses if desired
       const res = await fetch('/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: text })
+        body: JSON.stringify({ message: text, sid: SESSION_ID, chat_id: currentChatId })
       });
       const data = await res.json();
       typingDiv.remove();
