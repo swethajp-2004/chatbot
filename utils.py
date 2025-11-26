@@ -1,10 +1,11 @@
-# utils.py — final version for SQL Server + Flask chatbot
+
+# utils.py — corrected for headless server use
 import io
 import os
 import base64
 import matplotlib
 
-# Use headless backend for servers (important!)
+# Force non-GUI backend before importing pyplot (important on servers)
 matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
@@ -12,7 +13,7 @@ import pandas as pd
 from typing import List, Union, Iterable
 from html import escape
 
-# Optional OpenAI embeddings
+# Optional OpenAI wrapper for embeddings used by server; requires OPENAI_API_KEY in env.
 try:
     from openai import OpenAI
     _OPENAI_KEY = os.getenv("OPENAI_API_KEY")
@@ -20,16 +21,9 @@ try:
 except Exception:
     _openai_client = None
 
-
-# -------------------------
-# 🔹 Text Embedding (optional)
-# -------------------------
 def embed_text(texts: Union[str, List[str]], model: str = "text-embedding-3-small"):
-    """
-    Returns vector embeddings for a single text or list of texts using OpenAI API.
-    """
     if _openai_client is None:
-        raise RuntimeError("OpenAI client not configured. Set OPENAI_API_KEY in .env or remove embed_text usage.")
+        raise RuntimeError("OpenAI client not configured. Set OPENAI_API_KEY in environment or remove embed_text usage.")
     single = False
     if isinstance(texts, str):
         texts = [texts]
@@ -41,12 +35,7 @@ def embed_text(texts: Union[str, List[str]], model: str = "text-embedding-3-smal
     except Exception as e:
         raise RuntimeError(f"Embedding request failed: {e}")
 
-
-# -------------------------
-# 🔹 Plot utilities
-# -------------------------
 def _safe_float_list(values):
-    """Converts mixed numeric-like list into clean float list."""
     out = []
     for v in values:
         try:
@@ -58,31 +47,28 @@ def _safe_float_list(values):
                 continue
     return out
 
-
 def plot_to_base64(x: Iterable, y: Union[Iterable[float], Iterable[Iterable[float]]], kind='line', title=''):
-    """
-    Generates a chart (line, bar, pie, etc.) and returns base64 image URI for embedding in HTML.
-    """
     plt.close('all')
     fig, ax = plt.subplots(figsize=(8, 4.5))
     try:
         if kind == 'line':
             labels = list(map(str, x))
             vals = _safe_float_list(y)
-            ax.plot(labels, vals, marker='o', linewidth=2, color="#2c7be5")
+            ax.plot(labels, vals, marker='o', linewidth=2)
             for xi, yi in zip(labels, vals):
                 try:
                     ax.annotate(f"{yi:,.0f}", (xi, yi), textcoords="offset points", xytext=(0,6), ha='center', fontsize=8)
                 except Exception:
                     pass
             ax.set_ylabel("Value")
+            ax.set_xlabel("")
             plt.xticks(rotation=30, ha='right')
             plt.tight_layout()
 
         elif kind == 'bar':
             labels = list(map(str, x))
             vals = _safe_float_list(y)
-            ax.bar(labels, vals, color="#5bc0de")
+            ax.bar(labels, vals)
             for rect in ax.patches:
                 h = rect.get_height()
                 try:
@@ -109,7 +95,7 @@ def plot_to_base64(x: Iterable, y: Union[Iterable[float], Iterable[Iterable[floa
         elif kind == 'scatter':
             vals_x = _safe_float_list(x)
             vals_y = _safe_float_list(y)
-            ax.scatter(vals_x, vals_y, alpha=0.7, color="#6610f2")
+            ax.scatter(vals_x, vals_y, alpha=0.7)
             ax.set_xlabel("X")
             ax.set_ylabel("Y")
             plt.tight_layout()
@@ -126,7 +112,7 @@ def plot_to_base64(x: Iterable, y: Union[Iterable[float], Iterable[Iterable[floa
                 n = len(labels)
                 for i in range(len(series)):
                     if len(series[i]) < n:
-                        series[i] += [0.0] * (n - len(series[i]))
+                        series[i] = series[i] + [0.0] * (n - len(series[i]))
                     else:
                         series[i] = series[i][:n]
                 bottoms = [0.0] * n
@@ -138,7 +124,7 @@ def plot_to_base64(x: Iterable, y: Union[Iterable[float], Iterable[Iterable[floa
 
         elif kind == 'hist':
             vals = _safe_float_list(y)
-            ax.hist(vals, bins=20, color="#20c997")
+            ax.hist(vals, bins=20)
             ax.set_ylabel("Count")
             ax.set_xlabel(title or "Value")
             plt.tight_layout()
@@ -157,21 +143,15 @@ def plot_to_base64(x: Iterable, y: Union[Iterable[float], Iterable[Iterable[floa
         img_b64 = base64.b64encode(buf.read()).decode('ascii')
         plt.close(fig)
         return f"data:image/png;base64,{img_b64}"
-    except Exception as e:
+    except Exception:
+        # ensure figure closed on error
         try:
             plt.close(fig)
         except Exception:
             pass
-        raise RuntimeError(f"Plot failed: {e}")
+        raise
 
-
-# -------------------------
-# 🔹 HTML table formatter
-# -------------------------
 def rows_to_html_table(records):
-    """
-    Converts a list of dictionaries (records) into a clean, responsive HTML table.
-    """
     if not records:
         return "<p><i>No rows</i></p>"
 
@@ -190,19 +170,16 @@ def rows_to_html_table(records):
                 pass
         return escape(str(val))
 
-    html = [
-        "<div class='table-container'>",
-        "<table style='width:100%; border-collapse:collapse; border-radius:8px; overflow:hidden; font-family:Inter, sans-serif;'>",
-        "<thead style='background:#0d6efd; color:white;'>",
-        "<tr>"
-    ]
+    html = ['<div class="table-responsive"><table class="table" style="width:100%; border-collapse: collapse;">']
+    html.append("<thead><tr>")
     for h in headers:
-        html.append(f"<th style='padding:10px; text-align:left;'>{escape(h)}</th>")
-    html.append("</tr></thead><tbody>")
+        html.append(f"<th style='text-align:left; padding:8px; border-bottom:1px solid #ddd;'>{escape(h)}</th>")
+    html.append("</tr></thead>")
+    html.append("<tbody>")
     for r in records:
-        html.append("<tr style='background:#f8f9fa;'>")
+        html.append("<tr>")
         for h in headers:
-            html.append(f"<td style='padding:8px; border-bottom:1px solid #dee2e6;'>{fmt(r.get(h))}</td>")
+            html.append(f"<td style='padding:8px; border-bottom:1px solid #eee;'>{fmt(r.get(h))}</td>")
         html.append("</tr>")
     html.append("</tbody></table></div>")
     return "".join(html)
