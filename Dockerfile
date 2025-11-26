@@ -1,47 +1,30 @@
-# Dockerfile — builds Python app + Microsoft ODBC Driver 18 for SQL Server
-FROM python:3.13-slim
 
-ENV DEBIAN_FRONTEND=noninteractive
+# Use a full Python image so matplotlib + duckdb Just Work™
+FROM python:3.11
 
-# Install system dependencies required for pyodbc & msodbcsql
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        apt-transport-https \
-        ca-certificates \
-        curl \
-        gnupg \
-        wget \
-        build-essential \
-        unixodbc-dev \
-        locales \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install Microsoft package signing key and repo (write key into /usr/share/keyrings)
-RUN set -eux; \
-    mkdir -p /usr/share/keyrings; \
-    curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg; \
-    echo "deb [signed-by=/usr/share/keyrings/microsoft-prod.gpg] https://packages.microsoft.com/debian/12/prod bookworm main" \
-      > /etc/apt/sources.list.d/mssql-release.list; \
-    apt-get update; \
-    ACCEPT_EULA=Y apt-get install -y --no-install-recommends msodbcsql18; \
-    rm -rf /var/lib/apt/lists/*
-
-# Create app dir
-WORKDIR /app
-
-# Copy project files into container
-COPY . /app
-
-# Upgrade pip and install dependencies
-RUN python -m pip install --upgrade pip setuptools wheel
-
-# Install Python dependencies and gunicorn
-RUN if [ -f requirements.txt ]; then pip install -r requirements.txt; fi && \
-    pip install gunicorn
-
-# Prevent matplotlib font cache issues at runtime
+# Runtime envs
+ENV PYTHONUNBUFFERED=1
 ENV MPLCONFIGDIR=/tmp/.matplotlib
 
-ENV PORT=3000
+# App directory
+WORKDIR /app
+
+# Install Python deps first (better layer cache)
+COPY requirements.txt /app/requirements.txt
+RUN python -m pip install --upgrade pip setuptools wheel && \
+    pip install --no-cache-dir -r /app/requirements.txt && \
+    pip install --no-cache-dir gunicorn
+
+# Copy the rest of the application
+# (server.py, utils.py, index.html, static/, data/, etc.)
+COPY . /app
+
+# Expose app port (Render will set $PORT, but 3000 is our internal default)
 EXPOSE 3000
 
-CMD ["gunicorn", "server:app", "--bind", "0.0.0.0:3000", "--workers", "2"]
+# Gunicorn entrypoint:
+# - Use $PORT if Render provides it, otherwise default to 3000 (local)
+# - Use 1 worker to reduce concurrent startup pressure
+# - Increase timeout to 120 seconds to avoid worker timeouts while initializing
+# - Use 2 threads per worker for light concurrency in a single worker
+CMD ["sh", "-c", "gunicorn server:app --bind 0.0.0.0:${PORT:-3000} --workers 1 --threads 2 --timeout 120"]
