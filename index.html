@@ -9,10 +9,11 @@
   <style>
     * { box-sizing: border-box; font-family:'Inter',sans-serif; }
     :root{
-      --sidebar-bg1: #0f172a;
-      --sidebar-bg2: #1e293b;
-      --accent: #2563eb;
-      --accent-soft: #60a5fa;
+      /* Light palette: white + soft blues */
+      --sidebar-bg1: #ffffff;
+      --sidebar-bg2: #f3f4f6;
+      --accent: #3b82f6;
+      --accent-soft: #93c5fd;
       --muted: #64748b;
       --panel: #f1f5f9;
       --card: #ffffff;
@@ -25,9 +26,9 @@
       height:100vh;
       display:flex;
       background:
-        radial-gradient(circle at 0% 0%, rgba(129,140,248,0.18), transparent 55%),
-        radial-gradient(circle at 100% 100%, rgba(56,189,248,0.16), transparent 55%),
-        linear-gradient(180deg,#f8fafc 0%, #eff4fb 100%);
+        radial-gradient(circle at 0% 0%, rgba(129,140,248,0.12), transparent 55%),
+        radial-gradient(circle at 100% 100%, rgba(56,189,248,0.10), transparent 55%),
+        linear-gradient(180deg,#f9fbff 0%, #eef4ff 100%);
       color:#0f172a;
     }
 
@@ -35,43 +36,63 @@
     .sidebar {
       width:320px;
       background: linear-gradient(180deg,var(--sidebar-bg1), var(--sidebar-bg2));
-      color:#fff;
+      color:#0f172a;
       display:flex;
       flex-direction:column;
       padding:20px;
       gap:12px;
-      box-shadow: 4px 0 18px rgba(15,23,42,0.25);
+      box-shadow: 4px 0 18px rgba(15,23,42,0.08);
     }
-
+    .provider-btn {
+    width: 100%;
+    background: linear-gradient(135deg, #93c5fd, #60a5fa);
+    color: #0f172a;
+    border: none;
+    padding: 12px;
+    margin-top: 10px;
+    border-radius: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    text-align: left;
+    box-shadow: 0 6px 12px rgba(148,163,184,0.35);
+    transition: all 0.15s ease-in-out;
+}
+    .provider-btn:hover {
+    transform: translateY(-2px);
+    background: linear-gradient(135deg, #60a5fa, #3b82f6);
+    box-shadow: 0 10px 18px rgba(148,163,184,0.45);
+}
     .brand { display:flex; align-items:center; gap:12px; }
     .brand .logo {
       width:56px; height:56px; border-radius:16px;
       overflow:hidden; display:flex; align-items:center; justify-content:center;
-      background: radial-gradient(circle at 0% 0%, #bfdbfe, #1e293b);
-      box-shadow: 0 6px 14px rgba(15,23,42,0.45);
+      background: radial-gradient(circle at 0% 0%, #bfdbfe, #dbeafe);
+      box-shadow: 0 6px 14px rgba(148,163,184,0.5);
       flex-shrink:0;
     }
     .brand .logo img{ width:100%; height:100%; object-fit:contain; display:block; }
     .brand .title { display:flex; flex-direction:column; }
-    .brand .title .h { font-weight:700; font-size:1.05rem; letter-spacing:0.6px; color:#e5f0ff; }
-    .brand .title .sub { font-size:0.82rem; color:#cbd5f5; margin-top:4px; }
-
-    .new-chat-btn {
-      background:linear-gradient(120deg,#93c5fd,#60a5fa,#34d399);
+    .brand .title .h { font-weight:700; font-size:1.05rem; letter-spacing:0.6px; color:#1f2937; }
+    .brand .title .sub { font-size:0.82rem; color:#6b7280; margin-top:4px; }
+    
+    /* primary button style used for spectrum and provider buttons */
+    .primary-btn {
+      background:linear-gradient(120deg,#bfdbfe,#93c5fd);
       background-size:160% 160%;
       color:#0f172a;
       border:none;
       padding:12px;
-      border-radius:999px;
+      border-radius:12px;
       cursor:pointer;
-      font-weight:600;
-      box-shadow: 0 8px 18px rgba(37,99,235,0.35);
+      font-weight:700;
+      box-shadow: 0 8px 18px rgba(148,163,184,0.5);
       transition:all .18s;
+      text-align:center;
     }
-    .new-chat-btn:hover {
+    .primary-btn:hover {
       transform:translateY(-1px);
       background-position:100% 0;
-      box-shadow: 0 10px 20px rgba(37,99,235,0.4);
+      box-shadow: 0 10px 20px rgba(148,163,184,0.6);
     }
 
     .chats { overflow-y:auto; flex:1; margin-top:6px; padding-right:6px; }
@@ -80,47 +101,47 @@
       border-radius:12px;
       margin-bottom:10px;
       cursor:pointer;
-      background:rgba(15,23,42,0.12);
-      border:1px solid rgba(148,163,184,0.35);
+      background:#f3f4f6;
+      border:1px solid rgba(148,163,184,0.6);
       display:flex; justify-content:space-between; align-items:center; gap:12px;
       transition:all .14s;
     }
     .chat-item.active {
-      background:linear-gradient(135deg, rgba(59,130,246,0.2), rgba(37,99,235,0.25));
-      border-color: rgba(191,219,254,0.95);
-      box-shadow: 0 8px 18px rgba(15,23,42,0.45);
+      background:linear-gradient(135deg, rgba(191,219,254,0.8), rgba(219,234,254,0.95));
+      border-color: rgba(147,197,253,1);
+      box-shadow: 0 8px 18px rgba(148,163,184,0.4);
     }
     .chat-item:hover {
       transform:translateY(-1px);
-      border-color: rgba(148,163,184,0.8);
+      border-color: rgba(148,163,184,1);
     }
     .chat-meta { display:flex; flex-direction:column; flex:1; min-width:0; }
-    .chat-title { font-weight:600; color:#e5e7eb; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; font-size:0.95rem; }
-    .chat-time { color:#94a3b8; font-size:0.82rem; margin-top:4px; }
+    .chat-title { font-weight:600; color:#0f172a; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; font-size:0.95rem; }
+    .chat-time { color:#6b7280; font-size:0.82rem; margin-top:4px; }
     .chat-controls { display:flex; gap:8px; opacity:0; transition:opacity .12s; align-items:center; }
     .chat-item:hover .chat-controls { opacity:1; }
     .icon-btn {
-      background:rgba(15,23,42,0.25);
-      border:1px solid rgba(148,163,184,0.55);
-      color:#e5f0ff;
+      background:#e5e7eb;
+      border:1px solid rgba(148,163,184,0.7);
+      color:#1f2937;
       padding:6px;
       border-radius:999px;
       cursor:pointer;
       display:inline-flex; align-items:center; justify-content:center;
     }
-    .icon-btn.del { color:#fecaca; border-color:rgba(248,113,113,0.7); }
+    .icon-btn.del { color:#b91c1c; border-color:rgba(248,113,113,0.7); }
 
     /* Main area */
     .main { flex:1; display:flex; flex-direction:column; }
 
     header {
-      background: linear-gradient(90deg,#1d4ed8 0%, #2563eb 40%, #38bdf8 100%);
+      background: linear-gradient(90deg,#3b82f6 0%, #60a5fa 40%, #bfdbfe 100%);
       color:white;
       padding:18px 24px;
       display:flex;
       align-items:center;
       gap:18px;
-      box-shadow: 0 8px 20px rgba(15,23,42,0.25);
+      box-shadow: 0 8px 20px rgba(148,163,184,0.45);
     }
     header .top-left { display:flex; align-items:center; gap:12px; }
     header .title {
@@ -139,7 +160,7 @@
       height: calc(100vh - 120px);
       overflow:auto;
       align-items:center;
-      background:linear-gradient(180deg,#f8fafc 0%, #eef4fb 100%);
+      background:linear-gradient(180deg,#f8fafc 0%, #e5f0ff 100%);
     }
     .chat-column {
       width:100%;
@@ -182,7 +203,7 @@
       inset:-1px;
       border-radius:14px;
       padding:1px;
-      background:linear-gradient(135deg,rgba(59,130,246,0.45),rgba(129,140,248,0.35),rgba(45,212,191,0.4));
+      background:linear-gradient(135deg,rgba(59,130,246,0.3),rgba(129,140,248,0.25),rgba(45,212,191,0.25));
       -webkit-mask:linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
       -webkit-mask-composite: xor;
               mask-composite: exclude;
@@ -237,7 +258,7 @@
     }
 
     #send-btn {
-      background:linear-gradient(120deg,#60a5fa,#34d399);
+      background:linear-gradient(120deg,#60a5fa,#a5b4fc);
       background-size:140% 140%;
       color:#0f172a;
       border:none;
@@ -248,7 +269,7 @@
       letter-spacing:0.03em;
       text-transform:uppercase;
       font-size:0.85rem;
-      box-shadow: 0 6px 14px rgba(96,165,250,0.55);
+      box-shadow: 0 6px 14px rgba(96,165,250,0.5);
       transition:all .18s;
     }
     #send-btn:hover {
@@ -331,10 +352,26 @@
       </div>
     </div>
 
-    <button id="new-chat" class="new-chat-btn">+ New chat</button>
-    <div style="font-size:0.9rem;color:#e2e8f0;margin-top:6px;">Chats</div>
+    <!-- Spectrum main button -->
+    <button id="spectrum-btn" class="primary-btn" style="font-size:0.95rem;">
+      📊 Sales vs Install units (Spectrum)
+    </button>
+
+    <!-- Provider buttons: each labeled Sales vs Install units (Provider) -->
+    <div style="display:flex; flex-direction:column; gap:8px; margin-top:10px;">
+      <button id="att-btn" class="primary-btn" style="font-size:0.95rem;">
+        📊 Sales vs Install units (AT&amp;T)
+      </button>
+      <button id="comcast-btn" class="primary-btn" style="font-size:0.95rem;">
+        📊 Sales vs Install units (Comcast)
+      </button>
+      <button id="directv-btn" class="primary-btn" style="font-size:0.95rem;">
+        📊 Sales vs Install units (DIRECTV)
+      </button>
+    </div>
+    <button class="provider-btn" onclick="loadSummary()">Dataset Summary</button>
     <div id="chats" class="chats"></div>
-    <div style="font-size:0.8rem;color:#cbd5f5;margin-top:8px;">Saved on server · shows chat title & time</div>
+    <div style="font-size:0.8rem;color:#6b7280;margin-top:8px;">BundleAI can make mistakes. Check important information before using the answer.</div>
   </div>
 
   <div class="main">
@@ -355,24 +392,23 @@
       <button id="send-btn">Ask</button>
     </footer>
   </div>
-
 <script>
   // ---- State ----
   let currentChatId = null;
-  let chatsIndex = {}; // id -> meta
+  let chatsIndex = {}; // id -> meta (only persisted/visible chats)
   let messagesCache = {}; // id -> array of messages (each: {role, text, table_html, plot_data_uri, time})
+  const ephemeralChats = new Set();
 
   const chatsEl = document.getElementById('chats');
   const chatColumn = document.getElementById('chat-column');
   const input = document.getElementById('user-input');
   const sendBtn = document.getElementById('send-btn');
-  const newBtn = document.getElementById('new-chat');
   const topHeader = document.getElementById('top-header');
 
-  function formatDate(ts){ const d = new Date(ts); return d.toLocaleString(); }
+  function formatDate(ts){ const d = new Date(Number(ts)); return isNaN(d.getTime()) ? '' : d.toLocaleString(); }
   function escapeHtml(s){ return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 
-  // Session id helpers
+  // Session id helpers (kept as before)
   function uuidv4() {
     return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
       const r = Math.random() * 16 | 0, v = c === 'x' ? r : (r & 0x3 | 0x8);
@@ -388,6 +424,7 @@
     const secure = location.protocol === 'https:' ? ';Secure' : '';
     document.cookie = `${name}=${encodeURIComponent(value)};path=/;expires=${d.toUTCString()};SameSite=Lax${secure}`;
   }
+  
   function getSessionId() {
     let sid = getCookie('sid');
     if (!sid) {
@@ -407,10 +444,13 @@
     }
   }
 
+  // Render chat list (ephemeral filtered)
   function renderChatList(){
     chatsEl.innerHTML = '';
     const list = Object.values(chatsIndex).sort((a,b)=> (b.created_at||0) - (a.created_at||0));
     list.forEach(meta=>{
+      if(!meta || !meta.id) return;
+      if(ephemeralChats.has(meta.id)) return;
       const item = document.createElement('div');
       item.className = 'chat-item' + (meta.id===currentChatId ? ' active' : '');
       const metaDiv = document.createElement('div'); metaDiv.className='chat-meta';
@@ -421,11 +461,11 @@
 
       const controls = document.createElement('div'); controls.className='chat-controls';
       const renameBtn = document.createElement('button'); renameBtn.className='icon-btn'; renameBtn.title='Rename';
-      renameBtn.innerHTML = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25z" fill="#e5f0ff"/><path d="M20.71 7.04a1 1 0 0 0 0-1.41l-2.34-2.34a1 1 0 0 0-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z" fill="#e5f0ff"/></svg>';
+      renameBtn.innerHTML = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25z" fill="#1f2937"/><path d="M20.71 7.04a1 1 0 0 0 0-1.41l-2.34-2.34a1 1 0 0 0-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z" fill="#1f2937"/></svg>';
       renameBtn.onclick = (ev)=>{ ev.stopPropagation(); renameChat(meta.id); };
 
       const delBtn = document.createElement('button'); delBtn.className='icon-btn del'; delBtn.title='Delete';
-      delBtn.innerHTML = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M6 7h12" stroke="#fecaca" stroke-width="1.6" stroke-linecap="round"/><path d="M9 7V5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2" stroke="#fecaca" stroke-width="1.6" stroke-linecap="round"/><path d="M19 7l-1 13a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 7" stroke="#fecaca" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+      delBtn.innerHTML = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M6 7h12" stroke="#b91c1c" stroke-width="1.6" stroke-linecap="round"/><path d="M9 7V5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2" stroke="#b91c1c" stroke-width="1.6" stroke-linecap="round"/><path d="M19 7l-1 13a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 7" stroke="#b91c1c" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>';
       delBtn.onclick = (ev)=>{ ev.stopPropagation(); deleteChat(meta.id); };
 
       controls.appendChild(renameBtn);
@@ -444,7 +484,7 @@
     const controls = document.createElement('div');
     controls.className = 'msg-controls';
 
-    // COPY button (copies only the single message it's attached to)
+    // COPY button
     const copyBtn = document.createElement('button');
     copyBtn.className = 'msg-btn copy small';
     copyBtn.title = (msg.role === 'user') ? 'Copy question' : 'Copy answer';
@@ -502,7 +542,6 @@
         content.appendChild(img);
       }
 
-      // per-message download link if available
       if (msg.download_url) {
         const dl = document.createElement('a');
         dl.href = msg.download_url;
@@ -533,8 +572,6 @@
       const seen = getCookie('bundle_seen_before');
       if (!seen) {
         setCookie('bundle_seen_before', '1', 365);
-        await createNewChat();
-        return;
       }
 
       const res = await fetch('/memory/list?sid=' + encodeURIComponent(SESSION_ID));
@@ -542,34 +579,82 @@
       if(j && Array.isArray(j.chats)){
         chatsIndex = {};
         j.chats.forEach(c => chatsIndex[c.id] = c);
-        if(!currentChatId){
-          if(j.chats.length) await loadConversation(j.chats[0].id);
-          else await createNewChat();
+        if(Object.keys(chatsIndex).length){
+          const firstId = Object.keys(chatsIndex).sort((a,b)=> (chatsIndex[b].created_at||0) - (chatsIndex[a].created_at||0))[0];
+          await loadConversation(firstId);
         } else {
           renderChatList();
-          if(!chatsIndex[currentChatId]){
-            if(j.chats.length) await loadConversation(j.chats[0].id);
-            else await createNewChat();
-          }
         }
       } else {
-        await createNewChat();
+        renderChatList();
       }
     } catch(e){
       console.warn('loadChatsIndex failed', e);
-      await createNewChat();
+      renderChatList();
     }
   }
 
-  async function createNewChat(){
-    const id = 'chat-' + Date.now();
+  async function loadSummary() {
+    const chatId = currentChatId;
+    if (!chatId) {
+        await createNewChat(false);
+    }
+
+    // show a temporary bot "thinking…" message
+    const typingDiv = document.createElement("div");
+    typingDiv.className = "chat-message";
+    typingDiv.innerHTML = `<div class="bot" style="font-style:italic;color:#6b7280;border-style:dashed;">Loading summary...</div>`;
+    chatColumn.appendChild(typingDiv);
+    typingDiv.scrollIntoView({ behavior: "smooth" });
+
+    try {
+        const res = await fetch('/summary?sid=' + encodeURIComponent(SESSION_ID));
+        const data = await res.json();
+
+        typingDiv.remove();
+
+        const botMsg = {
+            role: 'bot',
+            text: data.reply || "(no reply)",
+            table_html: data.table_html || "",
+            plot_data_uri: data.plot_data_uri || "",
+            download_url: data.download_url || null,
+            time: Date.now()
+        };
+
+        messagesCache[currentChatId].push(botMsg);
+
+        if (!ephemeralChats.has(currentChatId)) {
+            await saveConversationToServer(currentChatId);
+        }
+
+        renderMessagesForCurrentChat();
+
+    } catch (err) {
+        typingDiv.remove();
+        const errMsg = {
+            role: 'bot',
+            text: '⚠️ Error loading summary.',
+            time: Date.now()
+        };
+        messagesCache[currentChatId].push(errMsg);
+        renderMessagesForCurrentChat();
+    }
+}
+
+  async function createNewChat(showInList = true){
+    const id = 'chat-' + Date.now() + '-' + Math.random().toString(36).slice(2,8);
     currentChatId = id;
-    chatsIndex[id] = { id, title: 'New chat', created_at: Date.now() };
     messagesCache[id] = [];
+    if(showInList){
+      chatsIndex[id] = { id, title: 'New chat', created_at: Date.now() };
+      await saveConversationToServer(id);
+    } else {
+      ephemeralChats.add(id);
+    }
     renderChatList();
     renderMessagesForCurrentChat();
-    setTopHeaderTitle(chatsIndex[id].title);
-    await saveConversationToServer(id);
+    setTopHeaderTitle(showInList ? (chatsIndex[id].title) : 'New Chat');
   }
 
   async function loadConversation(id){
@@ -580,19 +665,21 @@
         currentChatId = id;
         messagesCache[id] = j.messages || [];
         chatsIndex[id] = { id, title: j.title || 'Chat', created_at: j.created_at || Date.now() };
+        ephemeralChats.delete(id);
         renderChatList();
         renderMessagesForCurrentChat();
         setTopHeaderTitle(chatsIndex[id].title);
       } else {
-        await createNewChat();
+        renderChatList();
       }
     } catch(e){
       console.warn('loadConversation err', e);
-      await createNewChat();
+      renderChatList();
     }
   }
 
   async function saveConversationToServer(id){
+    if(ephemeralChats.has(id)) return;
     const payload = {
       sid: SESSION_ID,
       id,
@@ -620,9 +707,15 @@
       if(j && j.ok){
         delete chatsIndex[id];
         delete messagesCache[id];
+        ephemeralChats.delete(id);
         const keys = Object.keys(chatsIndex);
         if(keys.length) await loadConversation(keys[0]);
-        else await createNewChat();
+        else {
+          currentChatId = null;
+          renderChatList();
+          chatColumn.innerHTML = '';
+          setTopHeaderTitle('Bundle AI');
+        }
       } else {
         alert('Delete failed');
       }
@@ -637,10 +730,15 @@
     const current = meta.title || '';
     const newTitle = prompt('Rename chat', current);
     if(newTitle === null) return;
-    chatsIndex[id].title = newTitle || 'Chat';
+    if(ephemeralChats.has(id)){
+      chatsIndex[id] = { id, title: newTitle || 'Chat', created_at: Date.now() };
+      ephemeralChats.delete(id);
+      await saveConversationToServer(id);
+    } else {
+      chatsIndex[id].title = newTitle || 'Chat';
+      await saveConversationToServer(id);
+    }
     renderChatList();
-    messagesCache[id] = messagesCache[id] || [];
-    await saveConversationToServer(id);
     setTopHeaderTitle(chatsIndex[id].title);
   }
 
@@ -660,8 +758,10 @@
     }
     messagesCache[currentChatId] = arr;
     const firstUser = arr.find(m => m.role === 'user');
-    chatsIndex[currentChatId].title = firstUser ? (firstUser.text.slice(0,40) + (firstUser.text.length>40 ? '...' : '')) : 'Chat';
-    setTopHeaderTitle(chatsIndex[currentChatId].title);
+    if(!ephemeralChats.has(currentChatId) && chatsIndex[currentChatId]){
+      chatsIndex[currentChatId].title = firstUser ? (firstUser.text.slice(0,40) + (firstUser.text.length>40 ? '...' : '')) : 'Chat';
+    }
+    setTopHeaderTitle((chatsIndex[currentChatId] && chatsIndex[currentChatId].title) || 'Chat');
     await saveConversationToServer(currentChatId);
     renderChatList();
     renderMessagesForCurrentChat();
@@ -670,12 +770,25 @@
   async function sendMessage(){
     const text = input.value.trim();
     if(!text) return;
-    if(!currentChatId) await createNewChat();
+    if(!currentChatId){
+      await createNewChat(false);
+    }
 
+    // ensure message cache exists
     messagesCache[currentChatId] = messagesCache[currentChatId] || [];
+
+    // build history (conversation so far) in the format backend expects: {role, content}
+    const historyForServer = (messagesCache[currentChatId] || []).map(m => ({
+      role: m.role,
+      content: m.text || ''
+    }));
+
     const userMsg = { role:'user', text, time: Date.now() };
     messagesCache[currentChatId].push(userMsg);
-    await saveConversationToServer(currentChatId);
+
+    if(!ephemeralChats.has(currentChatId)){
+      await saveConversationToServer(currentChatId);
+    }
 
     renderMessagesForCurrentChat();
     input.value = '';
@@ -690,7 +803,12 @@
       const res = await fetch('/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: text, sid: SESSION_ID, chat_id: currentChatId })
+        body: JSON.stringify({
+          message: text,
+          sid: SESSION_ID,
+          chat_id: currentChatId,
+          history: historyForServer
+        })
       });
       const data = await res.json();
       typingDiv.remove();
@@ -709,10 +827,16 @@
         time: Date.now()
       };
       messagesCache[currentChatId].push(botMsg);
+
+      if(!ephemeralChats.has(currentChatId)){
+        await saveConversationToServer(currentChatId);
+      }
+
       const firstUser = messagesCache[currentChatId].find(m => m.role==='user');
-      chatsIndex[currentChatId].title = firstUser ? (firstUser.text.slice(0,40) + (firstUser.text.length>40 ? '...' : '')) : 'Chat';
-      setTopHeaderTitle(chatsIndex[currentChatId].title);
-      await saveConversationToServer(currentChatId);
+      if(!ephemeralChats.has(currentChatId) && chatsIndex[currentChatId]){
+        chatsIndex[currentChatId].title = firstUser ? (firstUser.text.slice(0,40) + (firstUser.text.length>40 ? '...' : '')) : 'Chat';
+      }
+      setTopHeaderTitle((chatsIndex[currentChatId] && chatsIndex[currentChatId].title) || 'Chat');
 
       renderChatList();
       renderMessagesForCurrentChat();
@@ -720,15 +844,89 @@
       typingDiv.remove();
       const errMsg = { role:'bot', text: '⚠️ Error connecting to server: ' + (err.message || err), time: Date.now() };
       messagesCache[currentChatId].push(errMsg);
-      await saveConversationToServer(currentChatId);
+      if(!ephemeralChats.has(currentChatId)){
+        await saveConversationToServer(currentChatId);
+      }
       renderMessagesForCurrentChat();
     }
   }
 
   sendBtn.addEventListener('click', sendMessage);
   input.addEventListener('keypress', (e) => { if(e.key === 'Enter') sendMessage(); });
-  newBtn.addEventListener('click', createNewChat);
 
+  // helper: create bot message element (reused by spectrum/provider fetchers)
+  function createBotMessageElement(replyText, table_html, download_url){
+    const wrapper = document.createElement('div');
+    wrapper.className = 'chat-message';
+    const content = document.createElement('div');
+    content.className = 'bot';
+    const title = document.createElement('div');
+    title.innerHTML = '<strong>BundleAI:</strong>';
+    const body = document.createElement('div');
+    body.className = 'bot-content';
+    body.innerHTML = escapeHtml(replyText || '').replace(/\n/g, '<br>');
+    content.appendChild(title);
+    content.appendChild(body);
+    if(table_html){
+      const wrap = document.createElement('div');
+      wrap.className = 'bot-table';
+      wrap.innerHTML = table_html;
+      content.appendChild(wrap);
+    }
+    if(download_url){
+      const a = document.createElement('a');
+      a.href = download_url;
+      a.target = '_blank';
+      a.rel = 'noopener noreferrer';
+      a.className = 'download-pill';
+      a.textContent = 'Download Excel';
+      content.appendChild(a);
+    }
+    wrapper.appendChild(content);
+    return wrapper;
+  }
+
+  // fetch and render for endpoints that return the same JSON shape as your /spectrum and provider endpoints
+  async function fetchAndRender(urlPath){
+    const typing = document.createElement('div');
+    typing.className = 'chat-message';
+    typing.innerHTML = '<div class="bot" style="font-style:italic;color:#6b7280;border-style:dashed;">Generating table...</div>';
+    chatColumn.appendChild(typing);
+    chatColumn.scrollTop = chatColumn.scrollHeight;
+    try {
+      const res = await fetch(urlPath);
+      if(!res.ok){
+        const txt = await res.text().catch(()=>null);
+        throw new Error(txt || `Status ${res.status}`);
+      }
+      const j = await res.json();
+      typing.remove();
+      const el = createBotMessageElement(j.reply || `Table`, j.table_html || '', j.download_url || null);
+      chatColumn.appendChild(el);
+      chatColumn.scrollTop = chatColumn.scrollHeight;
+    } catch (err){
+      typing.remove();
+      const el = createBotMessageElement('⚠️ Error generating table: ' + (err.message || err));
+      chatColumn.appendChild(el);
+      chatColumn.scrollTop = chatColumn.scrollHeight;
+    }
+  }
+
+  // attach handlers for spectrum and provider buttons (call specific endpoints)
+  document.getElementById('spectrum-btn').addEventListener('click', function(){
+    fetchAndRender('/spectrum');
+  });
+  document.getElementById('att-btn').addEventListener('click', function(){
+    fetchAndRender('/att');
+  });
+  document.getElementById('comcast-btn').addEventListener('click', function(){
+    fetchAndRender('/comcast');
+  });
+  document.getElementById('directv-btn').addEventListener('click', function(){
+    fetchAndRender('/directv');
+  });
+
+  // initial load
   loadChatsIndex();
 </script>
 </body>
