@@ -9,7 +9,7 @@ from flask import Flask, request, jsonify, send_from_directory, g
 import duckdb
 import pandas as pd
 import numpy as np
-from datetime import datetime
+from datetime import date
 from zoneinfo import ZoneInfo
 import time
 from utils import rows_to_html_table, plot_to_base64, embed_text  # your existing utils
@@ -17,6 +17,12 @@ import uuid
 from pathlib import Path
 import sqlite3
 import datetime as dtmod 
+from datetime import date as _date
+import uuid as _uuid
+import traceback as _traceback
+from html import escape as _escape
+from datetime import datetime as _dt
+
 # -------------------------------------------------
 # CONFIG / ENV
 # -------------------------------------------------
@@ -56,7 +62,7 @@ con = duckdb.connect(db_path)
 available_tables = [t[0] for t in con.execute("SHOW TABLES").fetchall()]
 print("Detected tables:", available_tables)
 
-TABLE = "sales_dataset"
+TABLE = "aiv_OrderItemUnit_md"
 if TABLE not in available_tables:
     for t in available_tables:
         if t.lower() == TABLE.lower():
@@ -329,7 +335,6 @@ Now output either:
 - NO_SQL
 """
 
-
         response = client.chat.completions.create(
             model=CHAT_MODEL,
             messages=[{"role": "user", "content": prompt}],
@@ -353,6 +358,7 @@ Now output either:
     except Exception as e:
         print(f"Error generating SQL: {e}", traceback.format_exc())
         return "NO_SQL"
+
 def ask_model_fix_sql(bad_sql: str, error: str, schema_cols: list, sample_rows: pd.DataFrame) -> str:
     """Ask LLM to fix problematic SQL."""
     try:
@@ -438,10 +444,7 @@ def answer_theory_question(question: str):
         _log_and_mask_error(e, "answer_theory_question")
         return _safe_user_error("I couldn't answer that right now. Please try again.")
 
-# -------------------------------------------------
-# CORE: handle_general_data_question
-# -------------------------------------------------
-def handle_general_data_question(question: str):
+def handle_general_data_question(question: str, history=None):
     """
     Single generic data handler:
     - Ask LLM for SQL or NO_SQL.
@@ -451,7 +454,27 @@ def handle_general_data_question(question: str):
     schema_cols = COLS
     qlow = (question or "").lower()
 
-    # --- NEW: handle ambiguous time phrases like "last year", "this month" or month without year ---
+    # --- conversation-aware context ---
+    history = history or []
+    if history:
+        ctx_lines = []
+        # keep last 6 messages to stay small
+        for m in history[-6:]:
+            role = m.get("role", "").upper()
+            content = (m.get("content") or "").strip()
+            if content:
+                ctx_lines.append(f"{role}: {content}")
+        context_block = "\n".join(ctx_lines)
+        augmented_question = (
+            "Conversation so far:\n"
+            f"{context_block}\n\n"
+            f"User's latest message:\nUSER: {question}\n"
+        )
+    else:
+        augmented_question = question
+    # -----------------------------------
+
+    # --- handle ambiguous time phrases like "last year", "this month" or month without year ---
     has_year = bool(re.search(r'\b20\d{2}\b', qlow))
 
     month_name = re.search(
@@ -475,25 +498,25 @@ def handle_general_data_question(question: str):
             "table_html": "",
             "plot_data_uri": None,
         }
-    # --- END NEW BLOCK ---
+    # --- END ambiguous time block ---
+
     try:
         sample_rows = con.execute(f"SELECT * FROM {TABLE} LIMIT 50").fetchdf()
     except Exception:
         sample_rows = SAMPLE_DF if not SAMPLE_DF.empty else pd.DataFrame(columns=COLS)
 
-    # 1) Ask model for SQL
-    sql_text = ask_model_for_sql(question, schema_cols, sample_rows)
+    # 1) Ask model for SQL  (conversation-aware)
+    sql_text = ask_model_for_sql(augmented_question, schema_cols, sample_rows)
 
-    # 2) If NO_SQL → theory/general mode
+    # 2) If NO_SQL → theory/general mode (conversation-aware)
     if not sql_text or sql_text.strip().upper() == "NO_SQL":
-        return answer_theory_question(question)
+        return answer_theory_question(augmented_question)
 
     # 3) Normalize & re-check
     sql_text = sql_text.strip()
     if not is_safe_select(sql_text):
         return _safe_user_error("Generated SQL was blocked for safety. Please rephrase your question.")
 
-    # 4) Execute with at most one auto-fix attempt
     # 4) Execute with at most one auto-fix attempt
     try_count = 0
     last_error = None
@@ -581,7 +604,7 @@ def handle_general_data_question(question: str):
         print("Export to Excel error:", e, traceback.format_exc())
         download_url = None
 
-    # 6) Let LLM summarize results
+    # 6) Let LLM summarize results (we keep showing the latest question here)
     explanation = ""
     if not df_preview.empty:
         preview_rows = df_preview.head(50).to_dict(orient="records")
@@ -675,6 +698,161 @@ def set_sid_cookie(response):
         pass
     return response
 
+# --- Provider endpoints: unified generator (updated to include 'installed' in Total) ---
+from datetime import datetime as _dt
+
+def _make_provider_route(route: str, provider_filter_sql: str, route_name: str):
+    """
+    Register a GET endpoint at `route` that returns the monthly table for the provider.
+    provider_filter_sql should be a SQL boolean expression using table columns
+    e.g. "LOWER(TRIM(ProviderName)) LIKE '%spectrum%'"
+    route_name must be unique (used as Flask endpoint name).
+    """
+
+    def handler():
+        try:
+            # optional ?year=YYYY, defaults to current year in TZ
+            try:
+                req_year = int(request.args.get("year")) if request.args.get("year") else None
+            except Exception:
+                req_year = None
+            if not req_year:
+                req_year = _dt.now(TZ).year
+
+            sale_date = qident('SaleDate')
+            status_col = qident('Status')
+
+            # SQL implementing the corrected status groups (installed included in Total)
+            sql = f"""
+            WITH flagged AS (
+              SELECT
+                STRFTIME('%Y', TRY_CAST({sale_date} AS DATE)) AS SaleYear,
+                STRFTIME('%m', TRY_CAST({sale_date} AS DATE)) AS SaleMonth,
+                LOWER(TRIM(COALESCE({status_col}, ''))) AS status_norm
+              FROM {qident(TABLE)}
+              WHERE TRY_CAST({sale_date} AS DATE) IS NOT NULL
+                AND ({provider_filter_sql})
+                AND STRFTIME('%Y', TRY_CAST({sale_date} AS DATE)) = '{req_year}'
+            ),
+            marks AS (
+              SELECT
+                CAST(SaleYear AS INTEGER) AS SaleYear,
+                CAST(SaleMonth AS INTEGER) AS SaleMonth,
+                -- CORRECTED: Total now includes both 'installed' AND 'installation'
+                CASE WHEN status_norm IN (
+                  'installed',
+                  'callinorder','onlineorder','pending activation',
+                  'pending cancel','spectrumpending','cancelled','disconnected'
+                ) THEN 1 ELSE 0 END AS is_total,
+                -- Install statuses (unchanged)
+                CASE WHEN status_norm IN ('installed','pending activation','disconnected') THEN 1 ELSE 0 END AS is_install,
+                -- Cancel statuses (unchanged)
+                CASE WHEN status_norm ='cancelled' THEN 1 ELSE 0 END AS is_cancel,
+                CASE WHEN status_norm = 'disconnected' THEN 1 ELSE 0 END AS is_disconnect
+              FROM flagged
+            ),
+            monthly AS (
+              SELECT
+                SaleYear,
+                SaleMonth,
+                SUM(is_total) AS Total,
+                SUM(is_install) AS Install,
+                SUM(is_cancel) AS Cancel,
+                SUM(is_disconnect) AS Disconnect
+              FROM marks
+              GROUP BY SaleYear, SaleMonth
+            ),
+            with_pending AS (
+              SELECT
+                SaleYear,
+                SaleMonth,
+                Total,
+                Install,
+                Cancel,
+                Disconnect,
+                (Total - Install - Cancel) AS Pending,
+                CASE WHEN Total = 0 THEN 0.0 ELSE 100.0 * Install / Total END AS InstallPct,
+                CASE WHEN Install = 0 THEN 0.0 ELSE 100.0 * Disconnect / Install END AS DisconnectPct,
+                LAG(Total - Install - Cancel) OVER (ORDER BY SaleYear DESC, SaleMonth DESC) AS PrevPending
+              FROM monthly
+            )
+            SELECT
+              SaleYear,
+              SaleMonth,
+              Total,
+              Pending,
+              CASE WHEN PrevPending IS NULL THEN CAST(Pending AS VARCHAR) || ' --> (CL:0)'
+                   ELSE CAST(Pending AS VARCHAR) || ' --> (CL:' || (Pending - PrevPending) || ')' END AS PendingWithCL,
+              Install,
+              Cancel,
+              ROUND(InstallPct, 2) AS InstallPct,
+              Disconnect,
+              ROUND(DisconnectPct, 2) AS DisconnectPct
+            FROM with_pending
+            ORDER BY SaleYear DESC, SaleMonth DESC
+            ;
+            """
+
+            df = run_sql_and_fetch_df(sql)
+            rows = df.to_dict(orient="records")
+            table_html = rows_to_html_table(rows)
+
+            # export
+            import uuid
+            file_id = uuid.uuid4().hex
+            filename = f"{file_id}_{route_name}.xlsx"
+            export_path = EXPORT_DIR / filename
+            df.to_excel(export_path, index=False)
+            download_url = f"/download/{filename}"
+
+            return jsonify({
+                "reply": f"{route_name} monthly table ({req_year}) generated.",
+                "table_html": table_html,
+                "plot_data_uri": None,
+                "download_url": download_url
+            })
+
+        except Exception as e:
+            print(f"{route_name} endpoint error:", e, traceback.format_exc())
+            return jsonify({
+                "reply": f"Failed to compute {route_name} table.",
+                "table_html": f"<pre>Error: {escape(str(e))}</pre>",
+                "plot_data_uri": None
+            }), 500
+
+    endpoint_name = f"provider_{route_name.replace(' ','_').lower()}"
+    if endpoint_name in app.view_functions:
+        app.view_functions.pop(endpoint_name, None)
+    app.add_url_rule(route, endpoint=endpoint_name, view_func=handler, methods=['GET'])
+
+
+# Register providers (same registration as before)
+_make_provider_route(
+    route="/spectrum",
+    provider_filter_sql="LOWER(TRIM(ProviderName)) LIKE '%spectrum%'",
+    route_name="Spectrum"
+)
+
+_make_provider_route(
+    route="/att",
+    provider_filter_sql="(LOWER(TRIM(ProviderName)) LIKE '%at&t%' OR LOWER(TRIM(ProviderName)) LIKE '%att%')",
+    route_name="AT&T"
+)
+
+_make_provider_route(
+    route="/comcast",
+    provider_filter_sql="LOWER(TRIM(ProviderName)) LIKE '%comcast%'",
+    route_name="Comcast"
+)
+
+_make_provider_route(
+    route="/directv",
+    provider_filter_sql="LOWER(TRIM(ProviderName)) LIKE '%directv%'",
+    route_name="DIRECTV"
+)
+# --- end updated provider endpoints ---
+
+
 @app.route('/')
 def index():
     return send_from_directory('.', 'index.html')
@@ -683,7 +861,7 @@ def index():
 def chat():
     payload = request.json or {}
     question = (payload.get('message') or "").strip()
-
+    history = payload.get('history') or []
     if not question:
         return jsonify({"error": "No message provided"}), 400
 
@@ -714,12 +892,12 @@ def chat():
             "plot_data_uri": None
         })
     if any(phrase in qlow for phrase in [
-    "what was last year",
-    "last year is what",
-    "which year was last year",
-    "previous year",
-]):
-        today=dtmod.date.today()
+        "what was last year",
+        "last year is what",
+        "which year was last year",
+        "previous year",
+    ]):
+        today = dtmod.date.today()
         return jsonify({
             "reply": f"Last year was {dtmod.date.today().year - 1}.",
             "table_html": "",
@@ -771,8 +949,7 @@ def chat():
             _log_and_mask_error(e, "count_rows_cols")
             return jsonify(_safe_user_error("Could not determine rows/cols right now.")), 500
 
-    # Default: generic data handler (SQL-or-theory brain)
-    resp = handle_general_data_question(question)
+    resp = handle_general_data_question(question, history=history)
     return jsonify(resp)
 
 # -------------------------------------------------
@@ -936,6 +1113,166 @@ def _save_conversation_single(chat_id, title, created_at, messages, session_id="
             return True
         except Exception:
             return False
+
+
+@app.route("/summary", methods=["GET"])
+def summary():
+    """
+    Returns dataset-level summary for the CURRENT YEAR (TZ = Asia/Kolkata).
+    JSON includes:
+      - year
+      - total_companies (distinct providers)
+      - total_orders (count rows)
+      - total_revenue (sum NetAfterChargeback)
+      - total_profit  (sum Profit)
+      - product counts: tv_count, mobile_count, homephone_count
+      - top_providers: small table (provider, orders, revenue, profit) top 10 by orders
+    Also returns table_html for top_providers and download_url (xlsx).
+    """
+    try:
+        # allow optional ?year=YYYY override
+        try:
+            req_year = int(request.args.get("year")) if request.args.get("year") else None
+        except Exception:
+            req_year = None
+        if not req_year:
+            req_year = _dt.now(TZ).year
+
+        # quoted identifiers
+        sale_date = qident("SaleDate")
+        provider_col = qident("ProviderName")
+        product_col = qident("ProductName")
+        revenue_col = qident("NetAfterChargeback")
+        profit_col = qident("Profit")
+        status_col = qident("Status")
+
+        # product keyword checks (case-insensitive)
+        # tv: look for 'tv', 'television', 'set-top', 'stb'
+        # mobile: 'mobile','cell','phone','smartphone'
+        # homephone/landline: 'homephone','home phone','landline'
+        sql = f"""
+        WITH year_rows AS (
+          SELECT
+            *
+          FROM {qident(TABLE)}
+          WHERE TRY_CAST({sale_date} AS DATE) IS NOT NULL
+            AND STRFTIME('%Y', TRY_CAST({sale_date} AS DATE)) = '{req_year}'
+        ),
+        metrics AS (
+          SELECT
+            COUNT(*) AS total_orders,
+            COUNT(DISTINCT LOWER(TRIM({provider_col}))) AS total_companies,
+            SUM(TRY_CAST(COALESCE({revenue_col}, '0') AS DOUBLE)) AS total_revenue,
+            SUM(TRY_CAST(COALESCE({profit_col}, '0') AS DOUBLE)) AS total_profit,
+            SUM(CASE WHEN LOWER(TRIM(COALESCE({product_col},''))) LIKE '%tv%' 
+                      OR LOWER(TRIM(COALESCE({product_col},''))) LIKE '%television%'
+                      OR LOWER(TRIM(COALESCE({product_col},''))) LIKE '%set-top%'
+                      OR LOWER(TRIM(COALESCE({product_col},''))) LIKE '%stb%'
+                     THEN 1 ELSE 0 END) AS tv_count,
+            SUM(CASE WHEN LOWER(TRIM(COALESCE({product_col},''))) LIKE '%mobile%'
+                      OR LOWER(TRIM(COALESCE({product_col},''))) LIKE '%cell%'
+                      OR LOWER(TRIM(COALESCE({product_col},''))) LIKE '%smartphone%'
+                      OR LOWER(TRIM(COALESCE({product_col},''))) LIKE '%phone%' -- catches 'mobile phone'
+                     THEN 1 ELSE 0 END) AS mobile_count,
+            SUM(CASE WHEN LOWER(TRIM(COALESCE({product_col},''))) LIKE '%homephone%'
+                      OR LOWER(TRIM(COALESCE({product_col},''))) LIKE '%home phone%'
+                      OR LOWER(TRIM(COALESCE({product_col},''))) LIKE '%landline%'
+                     THEN 1 ELSE 0 END) AS homephone_count
+          FROM year_rows
+        ),
+        top_providers AS (
+          SELECT
+            {provider_col} AS provider,
+            COUNT(*) AS orders,
+            SUM(TRY_CAST(COALESCE({revenue_col}, '0') AS DOUBLE)) AS revenue,
+            SUM(TRY_CAST(COALESCE({profit_col}, '0') AS DOUBLE)) AS profit
+          FROM year_rows
+          GROUP BY provider
+          ORDER BY orders DESC
+          LIMIT 10
+        )
+        SELECT
+          m.total_orders,
+          m.total_companies,
+          ROUND(m.total_revenue, 2) AS total_revenue,
+          ROUND(m.total_profit, 2) AS total_profit,
+          m.tv_count,
+          m.mobile_count,
+          m.homephone_count,
+          tp.provider,
+          tp.orders,
+          ROUND(tp.revenue, 2) AS provider_revenue,
+          ROUND(tp.profit, 2) AS provider_profit
+        FROM metrics m
+        LEFT JOIN top_providers tp ON 1=1
+        ;
+        """
+
+        # run query
+        df = run_sql_and_fetch_df(sql)
+
+        # df will have repeated metrics rows for each top provider row; extract metrics from first row
+        if df is None or df.empty:
+            return jsonify({
+                "reply": f"No data for year {req_year}",
+                "table_html": "<p><i>No data</i></p>",
+                "plot_data_uri": None
+            }), 200
+
+        # metrics
+        first = df.iloc[0]
+        result_metrics = {
+            "year": req_year,
+            "total_orders": int(first["total_orders"]) if not pd.isna(first["total_orders"]) else 0,
+            "total_companies": int(first["total_companies"]) if not pd.isna(first["total_companies"]) else 0,
+            "total_revenue": float(first["total_revenue"]) if not pd.isna(first["total_revenue"]) else 0.0,
+            "total_profit": float(first["total_profit"]) if not pd.isna(first["total_profit"]) else 0.0,
+            "tv_count": int(first["tv_count"]) if not pd.isna(first["tv_count"]) else 0,
+            "mobile_count": int(first["mobile_count"]) if not pd.isna(first["mobile_count"]) else 0,
+            "homephone_count": int(first["homephone_count"]) if not pd.isna(first["homephone_count"]) else 0,
+        }
+
+        # build top providers table (take columns provider, orders, provider_revenue, provider_profit)
+        top_cols = ["provider", "orders", "provider_revenue", "provider_profit"]
+        top_df = df[top_cols].dropna(subset=["provider"]).drop_duplicates(subset=["provider"]).reset_index(drop=True)
+        table_html = rows_to_html_table(top_df.to_dict(orient="records"))
+
+        # create export file (xlsx)
+        import uuid
+        file_id = uuid.uuid4().hex
+        filename = f"{file_id}_summary_{req_year}.xlsx"
+        export_path = EXPORT_DIR / filename
+        # write a small workbook containing metrics + top providers
+        try:
+            with pd.ExcelWriter(export_path, engine="openpyxl") as writer:
+                # metrics as dataframe
+                metrics_df = pd.DataFrame([result_metrics])
+                metrics_df.to_excel(writer, sheet_name="metrics", index=False)
+                top_df.to_excel(writer, sheet_name="top_providers", index=False)
+        except Exception:
+            # fallback: write top_df only
+            top_df.to_excel(export_path, index=False)
+
+        download_url = f"/download/{filename}"
+
+        response = {
+            "reply": f"Dataset summary for {req_year}",
+            "year": req_year,
+            "metrics": result_metrics,
+            "top_providers": top_df.to_dict(orient="records"),
+            "table_html": table_html,
+            "download_url": download_url,
+            "plot_data_uri": None
+        }
+        return jsonify(response)
+
+    except Exception as e:
+        print("Summary endpoint error:", e, traceback.format_exc())
+        return jsonify({
+            "reply": "Failed to compute summary.",
+            "table_html": f"<pre>Error: {escape(str(e))}</pre>",
+            "plot_data_uri": None
+        }), 500
 
 @app.route('/memory/list', methods=['GET'])
 def memory_list():
