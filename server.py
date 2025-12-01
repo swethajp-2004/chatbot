@@ -739,7 +739,7 @@ def _make_provider_route(route: str, provider_filter_sql: str, route_name: str):
                   'pending cancel','spectrumpending','cancelled','disconnected'
                 ) THEN 1 ELSE 0 END AS is_total,
                 -- Install statuses (unchanged)
-                CASE WHEN status_norm IN ('Installed','Pending Activation','Disconnected') THEN 1 ELSE 0 END AS is_install,
+                CASE WHEN status_norm IN ('installed','pending activation','disconnected') THEN 1 ELSE 0 END AS is_install,
                 -- Cancel statuses (unchanged)
                 CASE WHEN status_norm ='cancelled' THEN 1 ELSE 0 END AS is_cancel,
                 CASE WHEN status_norm = 'disconnected' THEN 1 ELSE 0 END AS is_disconnect
