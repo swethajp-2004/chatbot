@@ -5,7 +5,7 @@ import traceback
 from html import escape
 from dotenv import load_dotenv
 from openai import OpenAI
-from flask import Flask, request, jsonify, send_from_directory, g
+from flask import Flask, request, jsonify, send_from_directory, g, send_file
 import duckdb
 import pandas as pd
 import numpy as np
@@ -20,10 +20,10 @@ import datetime as dtmod
 from datetime import date as _date
 import uuid as _uuid
 import traceback as _traceback
-from html import escape as _escape
+from html import escape
 from datetime import datetime as _dt
+from io import BytesIO  # <-- added for in-memory Excel export
 
-# -------------------------------------------------
 # CONFIG / ENV
 # -------------------------------------------------
 load_dotenv()
@@ -43,11 +43,13 @@ if not OPENAI_API_KEY:
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# directory for Excel exports
+# directory for Excel exports (kept, but no longer used for auto-writing per-query)
 EXPORT_DIR = Path("./data/exports")
 EXPORT_DIR.mkdir(parents=True, exist_ok=True)
 
-# -------------------------------------------------
+# In-memory cache for exports: token -> DataFrame or dict of DataFrames
+EXPORT_CACHE = {}
+
 # DUCKDB CONNECTION
 # -------------------------------------------------
 db_path = DUCKDB_FILE.strip()
@@ -81,7 +83,6 @@ except Exception:
 
 print(f"Using table: {TABLE} rows={ROWCOUNT}, cols={len(COLS)}")
 
-# -------------------------------------------------
 # HELPER: column detection (revenue/profit/date)
 # -------------------------------------------------
 def find_best(cols, candidates):
@@ -144,7 +145,6 @@ HAS_CUST_LAST = any(c.lower() == "customerlastname" for c in COLS)
 CUST_FIRST_COL = next((c for c in COLS if c.lower() == "customerfirstname"), None)
 CUST_LAST_COL = next((c for c in COLS if c.lower() == "customerlastname"), None)
 
-# -------------------------------------------------
 # GENERIC HELPERS
 # -------------------------------------------------
 def run_sql_and_fetch_df(sql: str, print_errors: bool = True):
@@ -185,7 +185,6 @@ def is_safe_select(sql: str) -> bool:
             return False
     return True
 
-# -------------------------------------------------
 # INTENT CLASSIFICATION (cheap)
 # -------------------------------------------------
 def classify_intent(question: str) -> str:
@@ -208,7 +207,6 @@ def classify_intent(question: str) -> str:
     # everything else: treat as data question
     return "data_question"
 
-# -------------------------------------------------
 # LLM HELPERS
 # -------------------------------------------------
 def ask_model_for_sql(question: str, schema_cols: list, sample_rows: pd.DataFrame) -> str:
@@ -230,7 +228,7 @@ def ask_model_for_sql(question: str, schema_cols: list, sample_rows: pd.DataFram
         if CUST_FIRST_COL and CUST_LAST_COL:
             semantic_lines.append(
                 f"- CustomerFirstName + CustomerLastName together form the full customer name.\n"
-                f"  When the user says 'customer name' or 'customer names', use "
+                f"  When the user says 'customer name' or 'customer names' or 'customer' , use "
                 f"TRIM({CUST_FIRST_COL}) || ' ' || TRIM({CUST_LAST_COL}) as CustomerName and "
                 f"exclude rows where both are NULL or empty."
             )
@@ -473,7 +471,6 @@ def handle_general_data_question(question: str, history=None):
     else:
         augmented_question = question
     # -----------------------------------
-
     # --- handle ambiguous time phrases like "last year", "this month" or month without year ---
     has_year = bool(re.search(r'\b20\d{2}\b', qlow))
 
@@ -592,16 +589,14 @@ def handle_general_data_question(question: str, history=None):
         print("Plot error:", e, traceback.format_exc())
         plot_uri = None
 
-    # 5.a) Create Excel export
+    # 5.a) Prepare Excel export ONLY as in-memory cache; no file written to disk
     download_url = None
     try:
         file_id = uuid.uuid4().hex
-        filename = f"{file_id}.xlsx"
-        export_path = EXPORT_DIR / filename
-        df_preview.to_excel(export_path, index=False)
-        download_url = f"/download/{filename}"
+        EXPORT_CACHE[file_id] = df_preview  # store DataFrame in memory
+        download_url = f"/download/{file_id}"
     except Exception as e:
-        print("Export to Excel error:", e, traceback.format_exc())
+        print("Export cache error:", e, traceback.format_exc())
         download_url = None
 
     # 6) Let LLM summarize results (we keep showing the latest question here)
@@ -639,14 +634,13 @@ def handle_general_data_question(question: str, history=None):
         "plot_data_uri": plot_uri,
         "rows_returned": total_rows,
         "truncated": truncated,
-        "download_url": download_url,   # <-- frontend can show 'Download Excel'
+        "download_url": download_url,   # frontend can show 'Download Excel'
     }
     if DEBUG_SQL:
         result["debug_sql"] = sql_text
 
     return result
 
-# -------------------------------------------------
 # FLASK APP
 # -------------------------------------------------
 app = Flask(__name__, static_folder='static')
@@ -745,7 +739,7 @@ def _make_provider_route(route: str, provider_filter_sql: str, route_name: str):
                   'pending cancel','spectrumpending','cancelled','disconnected'
                 ) THEN 1 ELSE 0 END AS is_total,
                 -- Install statuses (unchanged)
-                CASE WHEN status_norm IN ('installed','pending activation','disconnected') THEN 1 ELSE 0 END AS is_install,
+                CASE WHEN status_norm IN ('Installed','Pending Activation','Disconnected') THEN 1 ELSE 0 END AS is_install,
                 -- Cancel statuses (unchanged)
                 CASE WHEN status_norm ='cancelled' THEN 1 ELSE 0 END AS is_cancel,
                 CASE WHEN status_norm = 'disconnected' THEN 1 ELSE 0 END AS is_disconnect
@@ -797,13 +791,11 @@ def _make_provider_route(route: str, provider_filter_sql: str, route_name: str):
             rows = df.to_dict(orient="records")
             table_html = rows_to_html_table(rows)
 
-            # export
+            # export (in-memory only)
             import uuid
             file_id = uuid.uuid4().hex
-            filename = f"{file_id}_{route_name}.xlsx"
-            export_path = EXPORT_DIR / filename
-            df.to_excel(export_path, index=False)
-            download_url = f"/download/{filename}"
+            EXPORT_CACHE[file_id] = df
+            download_url = f"/download/{file_id}"
 
             return jsonify({
                 "reply": f"{route_name} monthly table ({req_year}) generated.",
@@ -953,16 +945,39 @@ def chat():
     return jsonify(resp)
 
 # -------------------------------------------------
-# DOWNLOAD ENDPOINT FOR EXCEL
+# DOWNLOAD ENDPOINT FOR EXCEL (in-memory only)
 # -------------------------------------------------
-@app.route("/download/<filename>")
-def download_result(filename):
-    safe_name = os.path.basename(filename)
-    path = EXPORT_DIR / safe_name
-    if not path.exists():
-        return "File not found", 404
-    # You can change download_name if you want a friendlier default
-    return send_from_directory(EXPORT_DIR, safe_name, as_attachment=True, download_name="result.xlsx")
+@app.route("/download/<token>")
+def download_result(token):
+    # Look up the data for this token in the in-memory cache.
+    data = EXPORT_CACHE.get(token)
+    if data is None:
+        return "File not found or expired", 404
+
+    output = BytesIO()
+
+    # Data can be a single DataFrame or a dict of sheet_name -> DataFrame
+    if isinstance(data, dict):
+        # multiple sheets (used by /summary)
+        with pd.ExcelWriter(output, engine="openpyxl") as writer:
+            for sheet_name, df in data.items():
+                df.to_excel(writer, sheet_name=sheet_name, index=False)
+    else:
+        # single sheet
+        df = data
+        df.to_excel(output, index=False)
+
+    output.seek(0)
+
+    # Optional: remove from cache after first download so memory doesn't grow forever
+    EXPORT_CACHE.pop(token, None)
+
+    return send_file(
+        output,
+        as_attachment=True,
+        download_name="result.xlsx",
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
 
 # -------------------------------------------------
 # MEMORY MANAGEMENT (SQLite + JSON fallback)
@@ -1237,23 +1252,14 @@ def summary():
         top_df = df[top_cols].dropna(subset=["provider"]).drop_duplicates(subset=["provider"]).reset_index(drop=True)
         table_html = rows_to_html_table(top_df.to_dict(orient="records"))
 
-        # create export file (xlsx)
+        # prepare in-memory export (multi-sheet: metrics + top_providers)
         import uuid
         file_id = uuid.uuid4().hex
-        filename = f"{file_id}_summary_{req_year}.xlsx"
-        export_path = EXPORT_DIR / filename
-        # write a small workbook containing metrics + top providers
-        try:
-            with pd.ExcelWriter(export_path, engine="openpyxl") as writer:
-                # metrics as dataframe
-                metrics_df = pd.DataFrame([result_metrics])
-                metrics_df.to_excel(writer, sheet_name="metrics", index=False)
-                top_df.to_excel(writer, sheet_name="top_providers", index=False)
-        except Exception:
-            # fallback: write top_df only
-            top_df.to_excel(export_path, index=False)
-
-        download_url = f"/download/{filename}"
+        EXPORT_CACHE[file_id] = {
+            "metrics": pd.DataFrame([result_metrics]),
+            "top_providers": top_df
+        }
+        download_url = f"/download/{file_id}"
 
         response = {
             "reply": f"Dataset summary for {req_year}",
@@ -1366,6 +1372,7 @@ def memory_save():
     if not ok:
         return jsonify({"error": "Failed to save chat"}), 500
     return jsonify({"ok": True, "id": cid})
+
 @app.route("/health", methods=["GET"])
 def health():
     try:
@@ -1417,10 +1424,7 @@ def memory_delete():
             pass
         return jsonify({"error": f"Failed to delete chat: {e}"}), 500
 
-# -------------------------------------------------
 # MAIN
-# -------------------------------------------------
 if __name__ == "__main__":
     print(f"Starting server on http://localhost:{PORT} — using table {TABLE}")
     app.run(host="0.0.0.0", port=PORT)
-       
