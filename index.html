@@ -43,25 +43,27 @@
       gap:12px;
       box-shadow: 4px 0 18px rgba(15,23,42,0.08);
     }
+
     .provider-btn {
-    width: 100%;
-    background: linear-gradient(135deg, #93c5fd, #60a5fa);
-    color: #0f172a;
-    border: none;
-    padding: 12px;
-    margin-top: 10px;
-    border-radius: 12px;
-    font-weight: 600;
-    cursor: pointer;
-    text-align: left;
-    box-shadow: 0 6px 12px rgba(148,163,184,0.35);
-    transition: all 0.15s ease-in-out;
-}
+      width: 100%;
+      background: linear-gradient(135deg, #93c5fd, #60a5fa);
+      color: #0f172a;
+      border: none;
+      padding: 12px;
+      margin-top: 10px;
+      border-radius: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      text-align: left;
+      box-shadow: 0 6px 12px rgba(148,163,184,0.35);
+      transition: all 0.15s ease-in-out;
+    }
     .provider-btn:hover {
-    transform: translateY(-2px);
-    background: linear-gradient(135deg, #60a5fa, #3b82f6);
-    box-shadow: 0 10px 18px rgba(148,163,184,0.45);
-}
+      transform: translateY(-2px);
+      background: linear-gradient(135deg, #60a5fa, #3b82f6);
+      box-shadow: 0 10px 18px rgba(148,163,184,0.45);
+    }
+
     .brand { display:flex; align-items:center; gap:12px; }
     .brand .logo {
       width:56px; height:56px; border-radius:16px;
@@ -74,26 +76,6 @@
     .brand .title { display:flex; flex-direction:column; }
     .brand .title .h { font-weight:700; font-size:1.05rem; letter-spacing:0.6px; color:#1f2937; }
     .brand .title .sub { font-size:0.82rem; color:#6b7280; margin-top:4px; }
-    
-    /* primary button style used for spectrum and provider buttons */
-    .primary-btn {
-      background:linear-gradient(120deg,#bfdbfe,#93c5fd);
-      background-size:160% 160%;
-      color:#0f172a;
-      border:none;
-      padding:12px;
-      border-radius:12px;
-      cursor:pointer;
-      font-weight:700;
-      box-shadow: 0 8px 18px rgba(148,163,184,0.5);
-      transition:all .18s;
-      text-align:center;
-    }
-    .primary-btn:hover {
-      transform:translateY(-1px);
-      background-position:100% 0;
-      box-shadow: 0 10px 20px rgba(148,163,184,0.6);
-    }
 
     .chats { overflow-y:auto; flex:1; margin-top:6px; padding-right:6px; }
     .chat-item {
@@ -331,6 +313,31 @@
       background:#e5f0ff;
     }
 
+    /* Sample run pill under sample user messages */
+    .run-pill{
+      margin-top:10px;
+      align-self:flex-start;
+      background:#ffffff;
+      border:1px solid #cbd5e1;
+      padding:10px 12px;
+      border-radius:999px;
+      cursor:pointer;
+      display:inline-flex;
+      align-items:center;
+      gap:10px;
+      width:100%;
+      box-shadow:0 8px 20px rgba(148,163,184,0.35);
+      color:#0f172a;
+      transition:transform .12s, box-shadow .12s, background .12s;
+      user-select:none;
+    }
+    .run-pill:hover{
+      transform:translateY(-1px);
+      background:#f8fafc;
+      box-shadow:0 10px 24px rgba(148,163,184,0.45);
+    }
+    .run-pill svg{ width:18px; height:18px; }
+
     /* responsive */
     @media (max-width:900px){
       .sidebar{display:none;}
@@ -343,7 +350,6 @@
   <div class="sidebar">
     <div class="brand">
       <div class="logo">
-        <!-- Put your logo file in the same folder as this index.html with this filename -->
         <img src="/static/bundle_logo.png" alt="Bundle AI logo" />
       </div>
       <div class="title">
@@ -352,24 +358,9 @@
       </div>
     </div>
 
-    <!-- Spectrum main button -->
-    <button id="spectrum-btn" class="primary-btn" style="font-size:0.95rem;">
-      📊 Sales vs Install units (Spectrum)
-    </button>
+    <!-- Sample Questions button -->
+    <button id="sample-btn" class="provider-btn">Sample questions you can ask</button>
 
-    <!-- Provider buttons: each labeled Sales vs Install units (Provider) -->
-    <div style="display:flex; flex-direction:column; gap:8px; margin-top:10px;">
-      <button id="att-btn" class="primary-btn" style="font-size:0.95rem;">
-        📊 Sales vs Install units (AT&amp;T)
-      </button>
-      <button id="comcast-btn" class="primary-btn" style="font-size:0.95rem;">
-        📊 Sales vs Install units (Comcast)
-      </button>
-      <button id="directv-btn" class="primary-btn" style="font-size:0.95rem;">
-        📊 Sales vs Install units (DIRECTV)
-      </button>
-    </div>
-    <button class="provider-btn" onclick="loadSummary()">Dataset Summary</button>
     <div id="chats" class="chats"></div>
     <div style="font-size:0.8rem;color:#6b7280;margin-top:8px;">BundleAI can make mistakes. Check important information before using the answer.</div>
   </div>
@@ -392,6 +383,7 @@
       <button id="send-btn">Ask</button>
     </footer>
   </div>
+
 <script>
   // ---- State ----
   let currentChatId = null;
@@ -399,11 +391,15 @@
   let messagesCache = {}; // id -> array of messages (each: {role, text, table_html, plot_data_uri, time})
   const ephemeralChats = new Set();
 
+  // Sample chat id must match server.py
+  const SAMPLE_CHAT_ID = "sample-chat";
+
   const chatsEl = document.getElementById('chats');
   const chatColumn = document.getElementById('chat-column');
   const input = document.getElementById('user-input');
   const sendBtn = document.getElementById('send-btn');
   const topHeader = document.getElementById('top-header');
+  const sampleBtn = document.getElementById('sample-btn');
 
   function formatDate(ts){ const d = new Date(Number(ts)); return isNaN(d.getTime()) ? '' : d.toLocaleString(); }
   function escapeHtml(s){ return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
@@ -424,7 +420,7 @@
     const secure = location.protocol === 'https:' ? ';Secure' : '';
     document.cookie = `${name}=${encodeURIComponent(value)};path=/;expires=${d.toUTCString()};SameSite=Lax${secure}`;
   }
-  
+
   function getSessionId() {
     let sid = getCookie('sid');
     if (!sid) {
@@ -444,22 +440,29 @@
     }
   }
 
-  // Render chat list (ephemeral filtered)
+  // Render chat list (ephemeral filtered) + IMPORTANT: HIDE SAMPLE CHAT ITEM (so you don't see 2)
   function renderChatList(){
     chatsEl.innerHTML = '';
     const list = Object.values(chatsIndex).sort((a,b)=> (b.created_at||0) - (a.created_at||0));
     list.forEach(meta=>{
       if(!meta || !meta.id) return;
       if(ephemeralChats.has(meta.id)) return;
+
+      // ✅ DON’T render sample chat here — only access it via the button
+      if(meta.id === SAMPLE_CHAT_ID) return;
+
       const item = document.createElement('div');
       item.className = 'chat-item' + (meta.id===currentChatId ? ' active' : '');
       const metaDiv = document.createElement('div'); metaDiv.className='chat-meta';
+
       const titleDiv = document.createElement('div'); titleDiv.className='chat-title'; titleDiv.title = meta.title || 'Chat';
       titleDiv.innerText = meta.title || 'Chat';
+
       const tdiv = document.createElement('div'); tdiv.className='chat-time'; tdiv.innerText = meta.created_at ? formatDate(meta.created_at) : '';
       metaDiv.appendChild(titleDiv); metaDiv.appendChild(tdiv);
 
       const controls = document.createElement('div'); controls.className='chat-controls';
+
       const renameBtn = document.createElement('button'); renameBtn.className='icon-btn'; renameBtn.title='Rename';
       renameBtn.innerHTML = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25z" fill="#1f2937"/><path d="M20.71 7.04a1 1 0 0 0 0-1.41l-2.34-2.34a1 1 0 0 0-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z" fill="#1f2937"/></svg>';
       renameBtn.onclick = (ev)=>{ ev.stopPropagation(); renameChat(meta.id); };
@@ -481,6 +484,7 @@
   function createMessageElement(msg, index){
     const wrapper = document.createElement('div');
     wrapper.className = 'chat-message';
+
     const controls = document.createElement('div');
     controls.className = 'msg-controls';
 
@@ -508,20 +512,53 @@
     delBtn.className = 'msg-btn del small';
     delBtn.title = 'Delete message';
     delBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M3 6h18" stroke="#f97373" stroke-width="1.6" stroke-linecap="round"/><path d="M8 6v12a2 2 0 0 0 2 2h4a2 2 0 0 0 2-2V6" stroke="#f97373" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/><path d="M10 6V4a2 2 0 0 1 2-2h0a2 2 0 0 1 2 2v2" stroke="#f97373" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>';
-    delBtn.onclick = (ev) => { ev.stopPropagation(); handleDelete(msg, index); };
+
+    // Disable delete in sample chat
+    delBtn.onclick = (ev) => {
+      ev.stopPropagation();
+      if(currentChatId === SAMPLE_CHAT_ID) return;
+      handleDelete(msg, index);
+    };
 
     controls.appendChild(copyBtn);
     controls.appendChild(delBtn);
     wrapper.appendChild(controls);
+
+    const isSampleChat = (currentChatId === SAMPLE_CHAT_ID);
 
     if(msg.role === 'user'){
       const content = document.createElement('div');
       content.className = 'user';
       content.innerText = msg.text || '';
       wrapper.appendChild(content);
+
+      // Run pill for sample questions only (and only if no bot immediately after)
+      if(isSampleChat && (msg.text || '').trim()){
+        const arr = messagesCache[currentChatId] || [];
+        const hasBotAfter = (index + 1 < arr.length && arr[index + 1] && arr[index + 1].role === 'bot');
+        if(!hasBotAfter){
+          const run = document.createElement('div');
+          run.className = 'run-pill';
+          run.innerHTML = '<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M8 5v14l12-7-12-7z" stroke="#2563eb" stroke-width="1.8" stroke-linejoin="round"/></svg>Run this question';
+          run.onclick = (ev)=>{
+            ev.stopPropagation();
+            runSampleAt(index);
+          };
+          wrapper.appendChild(run);
+        }
+      }
+
     } else {
       const content = document.createElement('div');
       content.className = 'bot';
+
+      // Placeholder style
+      if(msg.__placeholder){
+        content.style.fontStyle = 'italic';
+        content.style.color = '#6b7280';
+        content.style.borderStyle = 'dashed';
+      }
+
       const title = document.createElement('div');
       title.innerHTML = `<strong>BundleAI:</strong>`;
       const body = document.createElement('div');
@@ -529,6 +566,7 @@
       body.innerHTML = escapeHtml(msg.text || '').replace(/\n/g, '<br>');
       content.appendChild(title);
       content.appendChild(body);
+
       if(msg.table_html){
         const tableWrap = document.createElement('div');
         tableWrap.className = 'bot-table';
@@ -567,6 +605,8 @@
     chatColumn.scrollTop = chatColumn.scrollHeight;
   }
 
+  // ✅ UPDATED: do NOT auto-open sample chat on load.
+  // Show normal chats list, and open the newest NON-SAMPLE chat if exists.
   async function loadChatsIndex(){
     try {
       const seen = getCookie('bundle_seen_before');
@@ -576,71 +616,41 @@
 
       const res = await fetch('/memory/list?sid=' + encodeURIComponent(SESSION_ID));
       const j = await res.json();
+
       if(j && Array.isArray(j.chats)){
         chatsIndex = {};
         j.chats.forEach(c => chatsIndex[c.id] = c);
-        if(Object.keys(chatsIndex).length){
-          const firstId = Object.keys(chatsIndex).sort((a,b)=> (chatsIndex[b].created_at||0) - (chatsIndex[a].created_at||0))[0];
-          await loadConversation(firstId);
-        } else {
-          renderChatList();
+        // Always force sample chat meta so it never breaks / duplicates
+        chatsIndex[SAMPLE_CHAT_ID] = { id: SAMPLE_CHAT_ID, title: 'Sample Questions', created_at: 1700000000000 };
+        
+        // Always keep sample in index (but we hide it in the sidebar list)
+        if(!chatsIndex[SAMPLE_CHAT_ID]){
+          chatsIndex[SAMPLE_CHAT_ID] = { id: SAMPLE_CHAT_ID, title: 'Sample Questions', created_at: 1700000000000 };
         }
+
+        renderChatList();
+
+        // Auto-open the newest non-sample chat, if any
+        const nonSample = Object.values(chatsIndex).filter(x => x && x.id && x.id !== SAMPLE_CHAT_ID);
+        if(nonSample.length){
+          nonSample.sort((a,b)=> (b.created_at||0) - (a.created_at||0));
+          await loadConversation(nonSample[0].id);
+        } else {
+          // If user has no chats, keep empty screen until they click sample button or ask a question
+          currentChatId = null;
+          chatColumn.innerHTML = '';
+          setTopHeaderTitle('BUNDLE AI');
+        }
+
       } else {
         renderChatList();
       }
+
     } catch(e){
       console.warn('loadChatsIndex failed', e);
       renderChatList();
     }
   }
-
-  async function loadSummary() {
-    const chatId = currentChatId;
-    if (!chatId) {
-        await createNewChat(false);
-    }
-
-    // show a temporary bot "thinking…" message
-    const typingDiv = document.createElement("div");
-    typingDiv.className = "chat-message";
-    typingDiv.innerHTML = `<div class="bot" style="font-style:italic;color:#6b7280;border-style:dashed;">Loading summary...</div>`;
-    chatColumn.appendChild(typingDiv);
-    typingDiv.scrollIntoView({ behavior: "smooth" });
-
-    try {
-        const res = await fetch('/summary?sid=' + encodeURIComponent(SESSION_ID));
-        const data = await res.json();
-
-        typingDiv.remove();
-
-        const botMsg = {
-            role: 'bot',
-            text: data.reply || "(no reply)",
-            table_html: data.table_html || "",
-            plot_data_uri: data.plot_data_uri || "",
-            download_url: data.download_url || null,
-            time: Date.now()
-        };
-
-        messagesCache[currentChatId].push(botMsg);
-
-        if (!ephemeralChats.has(currentChatId)) {
-            await saveConversationToServer(currentChatId);
-        }
-
-        renderMessagesForCurrentChat();
-
-    } catch (err) {
-        typingDiv.remove();
-        const errMsg = {
-            role: 'bot',
-            text: '⚠️ Error loading summary.',
-            time: Date.now()
-        };
-        messagesCache[currentChatId].push(errMsg);
-        renderMessagesForCurrentChat();
-    }
-}
 
   async function createNewChat(showInList = true){
     const id = 'chat-' + Date.now() + '-' + Math.random().toString(36).slice(2,8);
@@ -663,7 +673,14 @@
       if(res.status===200){
         const j = await res.json();
         currentChatId = id;
-        messagesCache[id] = j.messages || [];
+
+        // Sample chat should always show ONLY the preset sample questions
+        if (id === SAMPLE_CHAT_ID) {
+          messagesCache[id] = Array.isArray(j.messages) ? j.messages.slice(0) : [];
+        } else {
+          messagesCache[id] = j.messages || [];
+        }
+
         chatsIndex[id] = { id, title: j.title || 'Chat', created_at: j.created_at || Date.now() };
         ephemeralChats.delete(id);
         renderChatList();
@@ -680,6 +697,10 @@
 
   async function saveConversationToServer(id){
     if(ephemeralChats.has(id)) return;
+
+    // Do not save sample chat from client
+    if(id === SAMPLE_CHAT_ID) return;
+
     const payload = {
       sid: SESSION_ID,
       id,
@@ -698,6 +719,7 @@
   }
 
   async function deleteChat(id){
+    if(id === SAMPLE_CHAT_ID) return;
     if(!confirm('Delete this chat? This cannot be undone from the UI.')) return;
     try {
       const res = await fetch('/memory/delete', {
@@ -708,7 +730,7 @@
         delete chatsIndex[id];
         delete messagesCache[id];
         ephemeralChats.delete(id);
-        const keys = Object.keys(chatsIndex);
+        const keys = Object.keys(chatsIndex).filter(k=>k!==SAMPLE_CHAT_ID);
         if(keys.length) await loadConversation(keys[0]);
         else {
           currentChatId = null;
@@ -726,6 +748,7 @@
   }
 
   async function renameChat(id){
+    if(id === SAMPLE_CHAT_ID) return;
     const meta = chatsIndex[id] || {};
     const current = meta.title || '';
     const newTitle = prompt('Rename chat', current);
@@ -743,6 +766,7 @@
   }
 
   async function handleDelete(msg, idx){
+    if(currentChatId === SAMPLE_CHAT_ID) return;
     if(!confirm('Delete this message?')) return;
     const arr = messagesCache[currentChatId] || [];
     if(!Array.isArray(arr)) return;
@@ -770,14 +794,18 @@
   async function sendMessage(){
     const text = input.value.trim();
     if(!text) return;
+
+    // If currently in sample chat, create a real new ephemeral chat for user questions
+    if(currentChatId === SAMPLE_CHAT_ID){
+      await createNewChat(false);
+    }
+
     if(!currentChatId){
       await createNewChat(false);
     }
 
-    // ensure message cache exists
     messagesCache[currentChatId] = messagesCache[currentChatId] || [];
 
-    // build history (conversation so far) in the format backend expects: {role, content}
     const historyForServer = (messagesCache[currentChatId] || []).map(m => ({
       role: m.role,
       content: m.text || ''
@@ -851,81 +879,104 @@
     }
   }
 
+  // Run a sample question and show answer in SAME PLACE (replace Run pill)
+  async function runSampleAt(userMsgIndex){
+    try{
+      if(currentChatId !== SAMPLE_CHAT_ID) return;
+
+      const arr = messagesCache[currentChatId] || [];
+      const msg = arr[userMsgIndex];
+      if(!msg || msg.role !== 'user') return;
+
+      const question = (msg.text || '').trim();
+      if(!question) return;
+
+      // If already has a bot answer immediately after it, don't duplicate
+      if(userMsgIndex + 1 < arr.length && arr[userMsgIndex + 1] && arr[userMsgIndex + 1].role === 'bot'){
+        renderMessagesForCurrentChat();
+        return;
+      }
+
+      // Build history for server
+      const historyForServer = arr.map(m => ({
+        role: m.role,
+        content: m.text || ''
+      }));
+
+      // Insert placeholder bot right after this user message
+      const placeholder = {
+        role: 'bot',
+        text: 'BundleAI is thinking...',
+        table_html: '',
+        plot_data_uri: null,
+        download_url: null,
+        time: Date.now(),
+        __placeholder: true
+      };
+
+      arr.splice(userMsgIndex + 1, 0, placeholder);
+      messagesCache[currentChatId] = arr;
+      renderMessagesForCurrentChat();
+
+      const res = await fetch('/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          message: question,
+          sid: SESSION_ID,
+          chat_id:"sample-ephemeral",
+          history: historyForServer
+        })
+      });
+
+      const data = await res.json();
+
+      const replyText = data.reply || '(no reply)';
+      const table_html = data.table_html || '';
+      const plot_data_uri = data.plot_data_uri || data.plot_uri || '';
+      const download_url = data.download_url || null;
+
+      const finalBot = {
+        role:'bot',
+        text: replyText,
+        table_html,
+        plot_data_uri,
+        download_url,
+        time: Date.now()
+      };
+
+      // Replace placeholder that is directly after the user message
+      const arr2 = messagesCache[currentChatId] || [];
+      if(userMsgIndex + 1 < arr2.length && arr2[userMsgIndex + 1] && arr2[userMsgIndex + 1].__placeholder){
+        arr2[userMsgIndex + 1] = finalBot;
+      } else {
+        const idx = arr2.findIndex(m => m && m.__placeholder);
+        if(idx !== -1) arr2[idx] = finalBot;
+        else arr2.splice(userMsgIndex + 1, 0, finalBot);
+      }
+
+      messagesCache[currentChatId] = arr2;
+      renderMessagesForCurrentChat();
+
+    } catch(err){
+      console.warn('runSampleAt error', err);
+      const arr = messagesCache[currentChatId] || [];
+      const idx = arr.findIndex(m => m && m.__placeholder);
+      if(idx !== -1){
+        arr[idx] = { role:'bot', text:'⚠️ Error connecting to server: ' + (err.message || err), time: Date.now() };
+        messagesCache[currentChatId] = arr;
+        renderMessagesForCurrentChat();
+      }
+    }
+  }
+
   sendBtn.addEventListener('click', sendMessage);
   input.addEventListener('keypress', (e) => { if(e.key === 'Enter') sendMessage(); });
-
-  // helper: create bot message element (reused by spectrum/provider fetchers)
-  function createBotMessageElement(replyText, table_html, download_url){
-    const wrapper = document.createElement('div');
-    wrapper.className = 'chat-message';
-    const content = document.createElement('div');
-    content.className = 'bot';
-    const title = document.createElement('div');
-    title.innerHTML = '<strong>BundleAI:</strong>';
-    const body = document.createElement('div');
-    body.className = 'bot-content';
-    body.innerHTML = escapeHtml(replyText || '').replace(/\n/g, '<br>');
-    content.appendChild(title);
-    content.appendChild(body);
-    if(table_html){
-      const wrap = document.createElement('div');
-      wrap.className = 'bot-table';
-      wrap.innerHTML = table_html;
-      content.appendChild(wrap);
-    }
-    if(download_url){
-      const a = document.createElement('a');
-      a.href = download_url;
-      a.target = '_blank';
-      a.rel = 'noopener noreferrer';
-      a.className = 'download-pill';
-      a.textContent = 'Download Excel';
-      content.appendChild(a);
-    }
-    wrapper.appendChild(content);
-    return wrapper;
-  }
-
-  // fetch and render for endpoints that return the same JSON shape as your /spectrum and provider endpoints
-  async function fetchAndRender(urlPath){
-    const typing = document.createElement('div');
-    typing.className = 'chat-message';
-    typing.innerHTML = '<div class="bot" style="font-style:italic;color:#6b7280;border-style:dashed;">Generating table...</div>';
-    chatColumn.appendChild(typing);
-    chatColumn.scrollTop = chatColumn.scrollHeight;
-    try {
-      const res = await fetch(urlPath);
-      if(!res.ok){
-        const txt = await res.text().catch(()=>null);
-        throw new Error(txt || `Status ${res.status}`);
-      }
-      const j = await res.json();
-      typing.remove();
-      const el = createBotMessageElement(j.reply || `Table`, j.table_html || '', j.download_url || null);
-      chatColumn.appendChild(el);
-      chatColumn.scrollTop = chatColumn.scrollHeight;
-    } catch (err){
-      typing.remove();
-      const el = createBotMessageElement('⚠️ Error generating table: ' + (err.message || err));
-      chatColumn.appendChild(el);
-      chatColumn.scrollTop = chatColumn.scrollHeight;
-    }
-  }
-
-  // attach handlers for spectrum and provider buttons (call specific endpoints)
-  document.getElementById('spectrum-btn').addEventListener('click', function(){
-    fetchAndRender('/spectrum');
+  sampleBtn.addEventListener('click', async () => {
+    // Force a fresh reload every time (so it always shows again)
+    delete messagesCache[SAMPLE_CHAT_ID];
+    await loadConversation(SAMPLE_CHAT_ID);
   });
-  document.getElementById('att-btn').addEventListener('click', function(){
-    fetchAndRender('/att');
-  });
-  document.getElementById('comcast-btn').addEventListener('click', function(){
-    fetchAndRender('/comcast');
-  });
-  document.getElementById('directv-btn').addEventListener('click', function(){
-    fetchAndRender('/directv');
-  });
-
   // initial load
   loadChatsIndex();
 </script>
