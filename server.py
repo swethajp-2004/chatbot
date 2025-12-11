@@ -9,20 +9,14 @@ from flask import Flask, request, jsonify, send_from_directory, g, send_file
 import duckdb
 import pandas as pd
 import numpy as np
-from datetime import date
 from zoneinfo import ZoneInfo
 import time
 from utils import rows_to_html_table, plot_to_base64, embed_text  # your existing utils
 import uuid
 from pathlib import Path
 import sqlite3
-import datetime as dtmod 
-from datetime import date as _date
-import uuid as _uuid
-import traceback as _traceback
-from html import escape
-from datetime import datetime as _dt
-from io import BytesIO  # <-- added for in-memory Excel export
+import datetime as dtmod
+from io import BytesIO  # in-memory Excel export
 
 # CONFIG / ENV
 # -------------------------------------------------
@@ -50,6 +44,49 @@ EXPORT_DIR.mkdir(parents=True, exist_ok=True)
 # In-memory cache for exports: token -> DataFrame or dict of DataFrames
 EXPORT_CACHE = {}
 
+# -------------------------------------------------
+# SAMPLE CHAT (QUESTIONS ONLY; ALWAYS RUNS ON LATEST DATA)
+# -------------------------------------------------
+SAMPLE_CHAT_ID = "sample-chat"
+SAMPLE_CHAT_TITLE = "Sample Questions"
+SAMPLE_CHAT_CREATED_AT = 1700000000000  # stable timestamp (ms)
+
+SAMPLE_MESSAGES = [
+    {
+        "role": "bot",
+        "text": "Here are sample questions you can run. Click a sample question and press “Run this question” to get the latest answer.",
+        "table_html": "",
+        "plot_data_uri": None,
+        "download_url": None,
+        "time": SAMPLE_CHAT_CREATED_AT,
+    },
+    {"role": "user", "text": "show me the column names", "time": SAMPLE_CHAT_CREATED_AT + 1},
+    {"role": "user", "text": "give me any 5 account number from august 2025", "time": SAMPLE_CHAT_CREATED_AT + 2},
+    {"role": "user", "text": "give details of the account #554517388438", "time": SAMPLE_CHAT_CREATED_AT + 3},
+    {
+        "role": "user",
+        "text": "show me the total order,installation order,installation rate,profit,disconnection rate month wise where provider is spectrum for 2024",
+        "time": SAMPLE_CHAT_CREATED_AT + 4,
+    },
+    {
+        "role": "user",
+        "text": "show me the total installation order where installed order =1 based on provider for 2025",
+        "time": SAMPLE_CHAT_CREATED_AT + 5,
+    },
+    {"role": "user", "text": "give me the account number which had different customer names limit 10", "time": SAMPLE_CHAT_CREATED_AT + 6},
+    {"role": "user", "text": "show me the unique product names", "time": SAMPLE_CHAT_CREATED_AT + 7},
+    {"role": "user", "text": "give top 10 product name, their profit , profit rate based on profit rate for 2024", "time": SAMPLE_CHAT_CREATED_AT + 8},
+    {"role": "user", "text": "show me the cancellation count for provider spectrum where status = cancelled for august 2025", "time": SAMPLE_CHAT_CREATED_AT + 9},
+    {"role": "user", "text": "show me the distinct status values", "time": SAMPLE_CHAT_CREATED_AT + 10},
+]
+
+SAMPLE_CHAT = {
+    "id": SAMPLE_CHAT_ID,
+    "title": SAMPLE_CHAT_TITLE,
+    "created_at": SAMPLE_CHAT_CREATED_AT,
+    "messages": SAMPLE_MESSAGES,
+}
+
 # DUCKDB CONNECTION
 # -------------------------------------------------
 db_path = DUCKDB_FILE.strip()
@@ -58,28 +95,39 @@ if not (db_path.lower().startswith("md:") or db_path.lower().startswith("md://")
     if not os.path.exists(db_path):
         raise FileNotFoundError(f"DuckDB file not found: {db_path}")
 
-con = duckdb.connect(db_path)
+def _get_duck_con():
+    """
+    Per-request connection for concurrency safety.
+    IMPORTANT: Must match the same config everywhere to avoid:
+      "Can't open a connection to same database file with a different configuration"
+    """
+    local_con = duckdb.connect(db_path, read_only=True)
+    local_con.execute("PRAGMA enable_progress_bar=false;")
+    local_con.execute("PRAGMA threads=4;")
+    return local_con
 
-# Detect tables
-available_tables = [t[0] for t in con.execute("SHOW TABLES").fetchall()]
-print("Detected tables:", available_tables)
+# Detect tables / schema info (one-time metadata load using SAME config: read_only=True)
+with duckdb.connect(db_path, read_only=True) as _meta_con:
+    available_tables = [t[0] for t in _meta_con.execute("SHOW TABLES").fetchall()]
+    print("Detected tables:", available_tables)
 
-TABLE = "aiv_OrderItemUnit_md"
-if TABLE not in available_tables:
-    for t in available_tables:
-        if t.lower() == TABLE.lower():
-            TABLE = t
-            break
-# Basic schema info
-cols_info = con.execute(f"PRAGMA table_info('{TABLE}')").fetchall()
-COLS = [c[1] for c in cols_info] if cols_info else []
+    TABLE = "aiv_OrderItemUnit_md"
+    if TABLE not in available_tables:
+        for t in available_tables:
+            if t.lower() == TABLE.lower():
+                TABLE = t
+                break
 
-# Sample and row count
-SAMPLE_DF = con.execute(f"SELECT * FROM {TABLE} LIMIT 10").fetchdf() if COLS else pd.DataFrame()
-try:
-    ROWCOUNT = con.execute(f"SELECT COUNT(*) FROM {TABLE}").fetchone()[0]
-except Exception:
-    ROWCOUNT = None
+    # Basic schema info
+    cols_info = _meta_con.execute(f"PRAGMA table_info('{TABLE}')").fetchall()
+    COLS = [c[1] for c in cols_info] if cols_info else []
+
+    # Sample and row count
+    SAMPLE_DF = _meta_con.execute(f"SELECT * FROM {TABLE} LIMIT 10").fetchdf() if COLS else pd.DataFrame()
+    try:
+        ROWCOUNT = _meta_con.execute(f"SELECT COUNT(*) FROM {TABLE}").fetchone()[0]
+    except Exception:
+        ROWCOUNT = None
 
 print(f"Using table: {TABLE} rows={ROWCOUNT}, cols={len(COLS)}")
 
@@ -145,14 +193,13 @@ HAS_CUST_LAST = any(c.lower() == "customerlastname" for c in COLS)
 CUST_FIRST_COL = next((c for c in COLS if c.lower() == "customerfirstname"), None)
 CUST_LAST_COL = next((c for c in COLS if c.lower() == "customerlastname"), None)
 
-# GENERIC HELPERS
-# -------------------------------------------------
 def run_sql_and_fetch_df(sql: str, print_errors: bool = True):
     """Execute SQL and return a pandas DataFrame."""
     if DEBUG_SQL:
         print("DEBUG SQL:\n", sql)
     try:
-        df = con.execute(sql).fetchdf()
+        with _get_duck_con() as local_con:
+            df = local_con.execute(sql).fetchdf()
         return df
     except Exception as e:
         if print_errors:
@@ -185,27 +232,56 @@ def is_safe_select(sql: str) -> bool:
             return False
     return True
 
-# INTENT CLASSIFICATION (cheap)
 # -------------------------------------------------
+# Make formulas readable (avoid LaTeX)
+# -------------------------------------------------
+def strip_latex_math(text: str) -> str:
+    """
+    Convert common LaTeX math wrappers to plain text so frontend can read it.
+    Not a full LaTeX parser — just enough for \[ \], \( \), and simple \text{}.
+    """
+    if not text:
+        return text
+
+    t = text
+    t = re.sub(r"\\\[\s*", "", t)
+    t = re.sub(r"\s*\\\]", "", t)
+    t = re.sub(r"\\\(\s*", "", t)
+    t = re.sub(r"\s*\\\)", "", t)
+    t = re.sub(r"\\text\{([^}]*)\}", r"\1", t)
+    t = t.replace("\\%", "%").replace("\\_", "_")
+    t = re.sub(r"\n{3,}", "\n\n", t).strip()
+    return t
 def classify_intent(question: str) -> str:
     q = (question or "").strip().lower()
     if not q:
         return "empty"
 
-    # greetings
-    if q in {"hi", "hello", "hey", "yo", "hola", "sup"} or q.startswith(("hi ", "hello ", "hey ")):
+    # normalize: remove punctuation so "hi!" works
+    q_clean = re.sub(r'[^a-z\s]', ' ', q)
+    q_clean = re.sub(r'\s+', ' ', q_clean).strip()
+
+    # greetings / smalltalk
+    greetings = {
+        "hi", "hello", "hey", "yo", "hola", "sup",
+        "good morning", "good afternoon", "good evening"
+    }
+    if q_clean in greetings:
         return "smalltalk"
-    if "your name" in q or "who are you" in q:
+    if q_clean.startswith(("hi ", "hello ", "hey ")):
+        return "smalltalk"
+    if "your name" in q_clean or "who are you" in q_clean:
         return "smalltalk"
 
     # schema / metadata
-    if "what columns" in q or "what fields" in q or "show schema" in q:
+    if "what columns" in q_clean or "what fields" in q_clean or "show schema" in q_clean:
         return "meta"
-    if re.search(r'\b(show|list|display|give|what are)\b.*\b(column names?|columns|fields|attributes|headings)\b', q):
+    if re.search(r'\b(show|list|display|give|what are)\b.*\b(column names?|columns|fields|attributes|headings)\b', q_clean):
         return "meta"
 
     # everything else: treat as data question
     return "data_question"
+
 
 # LLM HELPERS
 # -------------------------------------------------
@@ -243,7 +319,8 @@ def ask_model_for_sql(question: str, schema_cols: list, sample_rows: pd.DataFram
         )
         extra_semantics = "\n".join(semantic_lines)
 
-        prompt = f"""
+        # IMPORTANT: rf""" ... """ avoids Python invalid-escape warnings like \[
+        prompt = rf"""
 You are an assistant that generates DuckDB SQL for a single table called {TABLE}.
 
 Your job:
@@ -293,28 +370,6 @@ Technical rules:
   • the identifying column(s) (e.g. ProviderName, MainChannel, Package), AND
   • the metric column(s) you are using (Profit, Revenue, EstimatedCommission, COUNT(*) AS orders, etc.)
   in the SELECT list.
-
-  Examples:
-  - "give me any 20 provider names based on profits" ⇒
-    SELECT ProviderName,
-           SUM(CAST(Profit AS DOUBLE)) AS total_profit
-    FROM {TABLE}
-    GROUP BY ProviderName
-    ORDER BY total_profit DESC
-    LIMIT 20;
-
-  - "give me the provider name whose estimated commission is 250" ⇒
-    SELECT ProviderName,
-           EstimatedCommission
-    FROM {TABLE}
-    WHERE EstimatedCommission = 250;
-
-  - "give me the mainchannel whose order > 150" ⇒
-    SELECT MainChannel,
-           COUNT(*) AS orders
-    FROM {TABLE}
-    GROUP BY MainChannel
-    HAVING COUNT(*) > 150;
 
 - If the question wants raw row details (not aggregation), include LIMIT {MAX_ROWS}, unless the user explicitly asks for "all ...".
 - If the question is purely conceptual/theory (definitions, explanations) without needing actual table values, return NO_SQL.
@@ -375,7 +430,7 @@ def ask_model_fix_sql(bad_sql: str, error: str, schema_cols: list, sample_rows: 
   column name from the schema is used.
 """
 
-        prompt = f"""
+        prompt = rf"""
 The following DuckDB SQL query failed with error: {error}
 
 Broken SQL:
@@ -419,20 +474,29 @@ Return ONLY the fixed SQL or NO_SQL. No explanations, no markdown.
         print(f"Error fixing SQL: {e}", traceback.format_exc())
         return "NO_SQL"
 
-
 def answer_theory_question(question: str):
     """For general / non-data questions, or when no safe SQL is generated."""
     try:
         resp = client.chat.completions.create(
             model=CHAT_MODEL,
             messages=[
-                {"role": "system", "content": "You are a clear, concise assistant. Explain things in simple terms."},
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a clear, concise assistant.\n"
+                        "IMPORTANT: Do NOT use LaTeX (no \\[ \\], no \\( \\)).\n"
+                        "If you need formulas, write them in plain text, like:\n"
+                        "Profit = Total Revenue - Total Costs\n"
+                        "Profit Rate (%) = (Profit / Total Revenue) * 100\n"
+                    ),
+                },
                 {"role": "user", "content": question},
             ],
             temperature=0.5,
             max_tokens=800,
         )
         ans = (resp.choices[0].message.content or "").strip()
+        ans = strip_latex_math(ans)
         return {
             "reply": ans,
             "table_html": "",
@@ -471,6 +535,7 @@ def handle_general_data_question(question: str, history=None):
     else:
         augmented_question = question
     # -----------------------------------
+
     # --- handle ambiguous time phrases like "last year", "this month" or month without year ---
     has_year = bool(re.search(r'\b20\d{2}\b', qlow))
 
@@ -498,7 +563,8 @@ def handle_general_data_question(question: str, history=None):
     # --- END ambiguous time block ---
 
     try:
-        sample_rows = con.execute(f"SELECT * FROM {TABLE} LIMIT 50").fetchdf()
+        with _get_duck_con() as local_con:
+            sample_rows = local_con.execute(f"SELECT * FROM {TABLE} LIMIT 50").fetchdf()
     except Exception:
         sample_rows = SAMPLE_DF if not SAMPLE_DF.empty else pd.DataFrame(columns=COLS)
 
@@ -521,7 +587,6 @@ def handle_general_data_question(question: str, history=None):
 
     while try_count < 2:
         try:
-            # first attempt: don't spam error logs
             df = run_sql_and_fetch_df(sql_text, print_errors=(try_count > 0))
             break
         except Exception as e:
@@ -593,13 +658,13 @@ def handle_general_data_question(question: str, history=None):
     download_url = None
     try:
         file_id = uuid.uuid4().hex
-        EXPORT_CACHE[file_id] = df_preview  # store DataFrame in memory
+        EXPORT_CACHE[file_id] = df_preview
         download_url = f"/download/{file_id}"
     except Exception as e:
         print("Export cache error:", e, traceback.format_exc())
         download_url = None
 
-    # 6) Let LLM summarize results (we keep showing the latest question here)
+    # 6) Let LLM summarize results
     explanation = ""
     if not df_preview.empty:
         preview_rows = df_preview.head(50).to_dict(orient="records")
@@ -611,18 +676,20 @@ def handle_general_data_question(question: str, history=None):
                 f"{json.dumps(preview_rows, ensure_ascii=False)}\n\n"
                 f"Please provide:\n"
                 f"1. One short headline-style summary line.\n"
-                f"2. One or two sentences explaining the key points in plain language."
+                f"2. One or two sentences explaining the key points in plain language.\n\n"
+                f"IMPORTANT: Do NOT use LaTeX. If you include formulas, write them in plain text."
             )
             resp = client.chat.completions.create(
                 model=CHAT_MODEL,
                 messages=[
-                    {"role": "system", "content": "You are a concise data analyst."},
+                    {"role": "system", "content": "You are a concise data analyst. Avoid LaTeX; use plain text formulas."},
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0.0,
                 max_tokens=256,
             )
             explanation = (resp.choices[0].message.content or "").strip()
+            explanation = strip_latex_math(explanation)
         except Exception:
             explanation = f"Here are the results for: {question}"
     else:
@@ -634,7 +701,7 @@ def handle_general_data_question(question: str, history=None):
         "plot_data_uri": plot_uri,
         "rows_returned": total_rows,
         "truncated": truncated,
-        "download_url": download_url,   # frontend can show 'Download Excel'
+        "download_url": download_url,
     }
     if DEBUG_SQL:
         result["debug_sql"] = sql_text
@@ -692,159 +759,6 @@ def set_sid_cookie(response):
         pass
     return response
 
-# --- Provider endpoints: unified generator (updated to include 'installed' in Total) ---
-from datetime import datetime as _dt
-
-def _make_provider_route(route: str, provider_filter_sql: str, route_name: str):
-    """
-    Register a GET endpoint at `route` that returns the monthly table for the provider.
-    provider_filter_sql should be a SQL boolean expression using table columns
-    e.g. "LOWER(TRIM(ProviderName)) LIKE '%spectrum%'"
-    route_name must be unique (used as Flask endpoint name).
-    """
-
-    def handler():
-        try:
-            # optional ?year=YYYY, defaults to current year in TZ
-            try:
-                req_year = int(request.args.get("year")) if request.args.get("year") else None
-            except Exception:
-                req_year = None
-            if not req_year:
-                req_year = _dt.now(TZ).year
-
-            sale_date = qident('SaleDate')
-            status_col = qident('Status')
-
-            # SQL implementing the corrected status groups (installed included in Total)
-            sql = f"""
-            WITH flagged AS (
-              SELECT
-                STRFTIME('%Y', TRY_CAST({sale_date} AS DATE)) AS SaleYear,
-                STRFTIME('%m', TRY_CAST({sale_date} AS DATE)) AS SaleMonth,
-                LOWER(TRIM(COALESCE({status_col}, ''))) AS status_norm
-              FROM {qident(TABLE)}
-              WHERE TRY_CAST({sale_date} AS DATE) IS NOT NULL
-                AND ({provider_filter_sql})
-                AND STRFTIME('%Y', TRY_CAST({sale_date} AS DATE)) = '{req_year}'
-            ),
-            marks AS (
-              SELECT
-                CAST(SaleYear AS INTEGER) AS SaleYear,
-                CAST(SaleMonth AS INTEGER) AS SaleMonth,
-                -- CORRECTED: Total now includes both 'installed' AND 'installation'
-                CASE WHEN status_norm IN (
-                  'installed',
-                  'callinorder','onlineorder','pending activation',
-                  'pending cancel','spectrumpending','cancelled','disconnected'
-                ) THEN 1 ELSE 0 END AS is_total,
-                -- Install statuses (unchanged)
-                CASE WHEN status_norm IN ('installed','pending activation','disconnected') THEN 1 ELSE 0 END AS is_install,
-                -- Cancel statuses (unchanged)
-                CASE WHEN status_norm ='cancelled' THEN 1 ELSE 0 END AS is_cancel,
-                CASE WHEN status_norm = 'disconnected' THEN 1 ELSE 0 END AS is_disconnect
-              FROM flagged
-            ),
-            monthly AS (
-              SELECT
-                SaleYear,
-                SaleMonth,
-                SUM(is_total) AS Total,
-                SUM(is_install) AS Install,
-                SUM(is_cancel) AS Cancel,
-                SUM(is_disconnect) AS Disconnect
-              FROM marks
-              GROUP BY SaleYear, SaleMonth
-            ),
-            with_pending AS (
-              SELECT
-                SaleYear,
-                SaleMonth,
-                Total,
-                Install,
-                Cancel,
-                Disconnect,
-                (Total - Install - Cancel) AS Pending,
-                CASE WHEN Total = 0 THEN 0.0 ELSE 100.0 * Install / Total END AS InstallPct,
-                CASE WHEN Install = 0 THEN 0.0 ELSE 100.0 * Disconnect / Install END AS DisconnectPct,
-                LAG(Total - Install - Cancel) OVER (ORDER BY SaleYear DESC, SaleMonth DESC) AS PrevPending
-              FROM monthly
-            )
-            SELECT
-              SaleYear,
-              SaleMonth,
-              Total,
-              Pending,
-              CASE WHEN PrevPending IS NULL THEN CAST(Pending AS VARCHAR) || ' --> (CL:0)'
-                   ELSE CAST(Pending AS VARCHAR) || ' --> (CL:' || (Pending - PrevPending) || ')' END AS PendingWithCL,
-              Install,
-              Cancel,
-              ROUND(InstallPct, 2) AS InstallPct,
-              Disconnect,
-              ROUND(DisconnectPct, 2) AS DisconnectPct
-            FROM with_pending
-            ORDER BY SaleYear DESC, SaleMonth DESC
-            ;
-            """
-
-            df = run_sql_and_fetch_df(sql)
-            rows = df.to_dict(orient="records")
-            table_html = rows_to_html_table(rows)
-
-            # export (in-memory only)
-            import uuid
-            file_id = uuid.uuid4().hex
-            EXPORT_CACHE[file_id] = df
-            download_url = f"/download/{file_id}"
-
-            return jsonify({
-                "reply": f"{route_name} monthly table ({req_year}) generated.",
-                "table_html": table_html,
-                "plot_data_uri": None,
-                "download_url": download_url
-            })
-
-        except Exception as e:
-            print(f"{route_name} endpoint error:", e, traceback.format_exc())
-            return jsonify({
-                "reply": f"Failed to compute {route_name} table.",
-                "table_html": f"<pre>Error: {escape(str(e))}</pre>",
-                "plot_data_uri": None
-            }), 500
-
-    endpoint_name = f"provider_{route_name.replace(' ','_').lower()}"
-    if endpoint_name in app.view_functions:
-        app.view_functions.pop(endpoint_name, None)
-    app.add_url_rule(route, endpoint=endpoint_name, view_func=handler, methods=['GET'])
-
-
-# Register providers (same registration as before)
-_make_provider_route(
-    route="/spectrum",
-    provider_filter_sql="LOWER(TRIM(ProviderName)) LIKE '%spectrum%'",
-    route_name="Spectrum"
-)
-
-_make_provider_route(
-    route="/att",
-    provider_filter_sql="(LOWER(TRIM(ProviderName)) LIKE '%at&t%' OR LOWER(TRIM(ProviderName)) LIKE '%att%')",
-    route_name="AT&T"
-)
-
-_make_provider_route(
-    route="/comcast",
-    provider_filter_sql="LOWER(TRIM(ProviderName)) LIKE '%comcast%'",
-    route_name="Comcast"
-)
-
-_make_provider_route(
-    route="/directv",
-    provider_filter_sql="LOWER(TRIM(ProviderName)) LIKE '%directv%'",
-    route_name="DIRECTV"
-)
-# --- end updated provider endpoints ---
-
-
 @app.route('/')
 def index():
     return send_from_directory('.', 'index.html')
@@ -859,6 +773,8 @@ def chat():
 
     qlow = question.lower()
     print(f"Q: {question}")
+
+    # quick date helpers
     if any(phrase in qlow for phrase in [
         "what year is this",
         "what year is it now",
@@ -866,11 +782,7 @@ def chat():
         "this year now",
         "what is today's year",
     ]):
-        return jsonify({
-            "reply": f"The current year is {dtmod.date.today().year}.",
-            "table_html": "",
-            "plot_data_uri": None
-        })
+        return jsonify({"reply": f"The current year is {dtmod.date.today().year}.", "table_html": "", "plot_data_uri": None})
 
     if any(phrase in qlow for phrase in [
         "what month is this",
@@ -878,23 +790,16 @@ def chat():
         "what month are we in",
     ]):
         today = dtmod.date.today()
-        return jsonify({
-            "reply": f"We are currently in {today.strftime('%B %Y')}.",
-            "table_html": "",
-            "plot_data_uri": None
-        })
+        return jsonify({"reply": f"We are currently in {today.strftime('%B %Y')}.", "table_html": "", "plot_data_uri": None})
+
     if any(phrase in qlow for phrase in [
         "what was last year",
         "last year is what",
         "which year was last year",
         "previous year",
     ]):
-        today = dtmod.date.today()
-        return jsonify({
-            "reply": f"Last year was {dtmod.date.today().year - 1}.",
-            "table_html": "",
-            "plot_data_uri": None
-        })
+        return jsonify({"reply": f"Last year was {dtmod.date.today().year - 1}.", "table_html": "", "plot_data_uri": None})
+
     if any(phrase in qlow for phrase in [
         "what is today",
         "today's date",
@@ -902,18 +807,15 @@ def chat():
         "what date is today",
     ]):
         today = dtmod.date.today()
-        return jsonify({
-            "reply": f"Today's date is {today.strftime('%B %d, %Y')}.",
-            "table_html": "",
-            "plot_data_uri": None
-        })
+        return jsonify({"reply": f"Today's date is {today.strftime('%B %d, %Y')}.", "table_html": "", "plot_data_uri": None})
 
     intent = classify_intent(question)
 
-    # Smalltalk
+    # IMPORTANT: no "Hi!" auto message (you said you don't want it)
+        # Smalltalk
     if intent == "smalltalk":
         return jsonify({
-            "reply": "Hi! I’m your data assistant. Ask me anything about this dataset or general concepts.",
+            "reply": "Hello 👋 I’m BundleAI. Ask me anything about your dataset — or click “Sample questions you can ask” to run examples.",
             "table_html": "",
             "plot_data_uri": None
         })
@@ -930,18 +832,25 @@ def chat():
     # Row/column count quick question
     if re.search(r'\bhow many rows\b|\brow count\b|\bnumber of rows\b', qlow):
         try:
-            rows = ROWCOUNT if ROWCOUNT is not None else con.execute(f"SELECT COUNT(*) FROM {TABLE}").fetchone()[0]
+            rows = ROWCOUNT
+            if rows is None:
+                with _get_duck_con() as local_con:
+                    rows = local_con.execute(f"SELECT COUNT(*) FROM {TABLE}").fetchone()[0]
             cols = len(COLS)
-            return jsonify({
-                "reply": f"The dataset contains {rows:,} rows and {cols} columns.",
-                "table_html": "",
-                "plot_data_uri": None
-            })
+            return jsonify({"reply": f"The dataset contains {rows:,} rows and {cols} columns.", "table_html": "", "plot_data_uri": None})
         except Exception as e:
             _log_and_mask_error(e, "count_rows_cols")
             return jsonify(_safe_user_error("Could not determine rows/cols right now.")), 500
 
     resp = handle_general_data_question(question, history=history)
+
+    # Ensure no LaTeX leaks
+    try:
+        if isinstance(resp, dict) and "reply" in resp:
+            resp["reply"] = strip_latex_math(resp.get("reply") or "")
+    except Exception:
+        pass
+
     return jsonify(resp)
 
 # -------------------------------------------------
@@ -949,27 +858,21 @@ def chat():
 # -------------------------------------------------
 @app.route("/download/<token>")
 def download_result(token):
-    # Look up the data for this token in the in-memory cache.
     data = EXPORT_CACHE.get(token)
     if data is None:
         return "File not found or expired", 404
 
     output = BytesIO()
 
-    # Data can be a single DataFrame or a dict of sheet_name -> DataFrame
     if isinstance(data, dict):
-        # multiple sheets (used by /summary)
         with pd.ExcelWriter(output, engine="openpyxl") as writer:
             for sheet_name, df in data.items():
                 df.to_excel(writer, sheet_name=sheet_name, index=False)
     else:
-        # single sheet
         df = data
         df.to_excel(output, index=False)
 
     output.seek(0)
-
-    # Optional: remove from cache after first download so memory doesn't grow forever
     EXPORT_CACHE.pop(token, None)
 
     return send_file(
@@ -1000,6 +903,7 @@ def _ensure_chats_table_and_migration(db_path: Path):
             );
         """)
         conn.commit()
+
         cur.execute("PRAGMA table_info(chats);")
         existing_cols = [r[1] for r in cur.fetchall()]
 
@@ -1012,12 +916,14 @@ def _ensure_chats_table_and_migration(db_path: Path):
 
         cur.execute("PRAGMA table_info(chats);")
         existing_cols = [r[1] for r in cur.fetchall()]
+
         if 'messages_json' not in existing_cols:
             try:
                 cur.execute("ALTER TABLE chats ADD COLUMN messages_json TEXT;")
                 conn.commit()
             except Exception:
                 pass
+
         cur.close()
     finally:
         conn.close()
@@ -1041,10 +947,12 @@ def _row_to_conv(row):
         created_at = 0
         session_id = ""
         messages_json = ""
+
     try:
         messages = json.loads(messages_json) if messages_json else []
     except Exception:
         messages = []
+
     return {
         "id": cid,
         "title": title,
@@ -1067,6 +975,7 @@ def _load_conversations():
                     "SELECT id, title, created_at, messages_json "
                     "FROM chats ORDER BY created_at DESC"
                 ).fetchall()
+
         out = {}
         for r in rows:
             conv = _row_to_conv(r)
@@ -1077,7 +986,7 @@ def _load_conversations():
                 "messages": conv.get("messages", [])
             }
         return out
-    except Exception as e:
+    except Exception:
         try:
             if MEMORY_FILE.exists():
                 return json.load(open(MEMORY_FILE, 'r', encoding='utf8'))
@@ -1092,6 +1001,7 @@ def _save_conversation_single(chat_id, title, created_at, messages, session_id="
             cur = conn.cursor()
             cur.execute("PRAGMA table_info(chats);")
             existing_cols = [r[1] for r in cur.fetchall()]
+
             if 'session_id' in existing_cols and 'messages_json' in existing_cols:
                 cur.execute(
                     "INSERT OR REPLACE INTO chats (id, title, created_at, session_id, messages_json) "
@@ -1106,9 +1016,10 @@ def _save_conversation_single(chat_id, title, created_at, messages, session_id="
                 )
             else:
                 raise RuntimeError("SQLite schema missing messages_json column")
+
             conn.commit()
         return True
-    except Exception as e:
+    except Exception:
         try:
             all_conv = {}
             if MEMORY_FILE.exists():
@@ -1129,157 +1040,6 @@ def _save_conversation_single(chat_id, title, created_at, messages, session_id="
         except Exception:
             return False
 
-
-@app.route("/summary", methods=["GET"])
-def summary():
-    """
-    Returns dataset-level summary for the CURRENT YEAR (TZ = Asia/Kolkata).
-    JSON includes:
-      - year
-      - total_companies (distinct providers)
-      - total_orders (count rows)
-      - total_revenue (sum NetAfterChargeback)
-      - total_profit  (sum Profit)
-      - product counts: tv_count, mobile_count, homephone_count
-      - top_providers: small table (provider, orders, revenue, profit) top 10 by orders
-    Also returns table_html for top_providers and download_url (xlsx).
-    """
-    try:
-        # allow optional ?year=YYYY override
-        try:
-            req_year = int(request.args.get("year")) if request.args.get("year") else None
-        except Exception:
-            req_year = None
-        if not req_year:
-            req_year = _dt.now(TZ).year
-
-        # quoted identifiers
-        sale_date = qident("SaleDate")
-        provider_col = qident("ProviderName")
-        product_col = qident("ProductName")
-        revenue_col = qident("NetAfterChargeback")
-        profit_col = qident("Profit")
-        status_col = qident("Status")
-
-        # product keyword checks (case-insensitive)
-        # tv: look for 'tv', 'television', 'set-top', 'stb'
-        # mobile: 'mobile','cell','phone','smartphone'
-        # homephone/landline: 'homephone','home phone','landline'
-        sql = f"""
-        WITH year_rows AS (
-          SELECT
-            *
-          FROM {qident(TABLE)}
-          WHERE TRY_CAST({sale_date} AS DATE) IS NOT NULL
-            AND STRFTIME('%Y', TRY_CAST({sale_date} AS DATE)) = '{req_year}'
-        ),
-        metrics AS (
-          SELECT
-            COUNT(*) AS total_orders,
-            COUNT(DISTINCT LOWER(TRIM({provider_col}))) AS total_companies,
-            SUM(TRY_CAST(COALESCE({revenue_col}, '0') AS DOUBLE)) AS total_revenue,
-            SUM(TRY_CAST(COALESCE({profit_col}, '0') AS DOUBLE)) AS total_profit,
-            SUM(CASE WHEN LOWER(TRIM(COALESCE({product_col},''))) LIKE '%tv%' 
-                      OR LOWER(TRIM(COALESCE({product_col},''))) LIKE '%television%'
-                      OR LOWER(TRIM(COALESCE({product_col},''))) LIKE '%set-top%'
-                      OR LOWER(TRIM(COALESCE({product_col},''))) LIKE '%stb%'
-                     THEN 1 ELSE 0 END) AS tv_count,
-            SUM(CASE WHEN LOWER(TRIM(COALESCE({product_col},''))) LIKE '%mobile%'
-                      OR LOWER(TRIM(COALESCE({product_col},''))) LIKE '%cell%'
-                      OR LOWER(TRIM(COALESCE({product_col},''))) LIKE '%smartphone%'
-                      OR LOWER(TRIM(COALESCE({product_col},''))) LIKE '%phone%' -- catches 'mobile phone'
-                     THEN 1 ELSE 0 END) AS mobile_count,
-            SUM(CASE WHEN LOWER(TRIM(COALESCE({product_col},''))) LIKE '%homephone%'
-                      OR LOWER(TRIM(COALESCE({product_col},''))) LIKE '%home phone%'
-                      OR LOWER(TRIM(COALESCE({product_col},''))) LIKE '%landline%'
-                     THEN 1 ELSE 0 END) AS homephone_count
-          FROM year_rows
-        ),
-        top_providers AS (
-          SELECT
-            {provider_col} AS provider,
-            COUNT(*) AS orders,
-            SUM(TRY_CAST(COALESCE({revenue_col}, '0') AS DOUBLE)) AS revenue,
-            SUM(TRY_CAST(COALESCE({profit_col}, '0') AS DOUBLE)) AS profit
-          FROM year_rows
-          GROUP BY provider
-          ORDER BY orders DESC
-          LIMIT 10
-        )
-        SELECT
-          m.total_orders,
-          m.total_companies,
-          ROUND(m.total_revenue, 2) AS total_revenue,
-          ROUND(m.total_profit, 2) AS total_profit,
-          m.tv_count,
-          m.mobile_count,
-          m.homephone_count,
-          tp.provider,
-          tp.orders,
-          ROUND(tp.revenue, 2) AS provider_revenue,
-          ROUND(tp.profit, 2) AS provider_profit
-        FROM metrics m
-        LEFT JOIN top_providers tp ON 1=1
-        ;
-        """
-
-        # run query
-        df = run_sql_and_fetch_df(sql)
-
-        # df will have repeated metrics rows for each top provider row; extract metrics from first row
-        if df is None or df.empty:
-            return jsonify({
-                "reply": f"No data for year {req_year}",
-                "table_html": "<p><i>No data</i></p>",
-                "plot_data_uri": None
-            }), 200
-
-        # metrics
-        first = df.iloc[0]
-        result_metrics = {
-            "year": req_year,
-            "total_orders": int(first["total_orders"]) if not pd.isna(first["total_orders"]) else 0,
-            "total_companies": int(first["total_companies"]) if not pd.isna(first["total_companies"]) else 0,
-            "total_revenue": float(first["total_revenue"]) if not pd.isna(first["total_revenue"]) else 0.0,
-            "total_profit": float(first["total_profit"]) if not pd.isna(first["total_profit"]) else 0.0,
-            "tv_count": int(first["tv_count"]) if not pd.isna(first["tv_count"]) else 0,
-            "mobile_count": int(first["mobile_count"]) if not pd.isna(first["mobile_count"]) else 0,
-            "homephone_count": int(first["homephone_count"]) if not pd.isna(first["homephone_count"]) else 0,
-        }
-
-        # build top providers table (take columns provider, orders, provider_revenue, provider_profit)
-        top_cols = ["provider", "orders", "provider_revenue", "provider_profit"]
-        top_df = df[top_cols].dropna(subset=["provider"]).drop_duplicates(subset=["provider"]).reset_index(drop=True)
-        table_html = rows_to_html_table(top_df.to_dict(orient="records"))
-
-        # prepare in-memory export (multi-sheet: metrics + top_providers)
-        import uuid
-        file_id = uuid.uuid4().hex
-        EXPORT_CACHE[file_id] = {
-            "metrics": pd.DataFrame([result_metrics]),
-            "top_providers": top_df
-        }
-        download_url = f"/download/{file_id}"
-
-        response = {
-            "reply": f"Dataset summary for {req_year}",
-            "year": req_year,
-            "metrics": result_metrics,
-            "top_providers": top_df.to_dict(orient="records"),
-            "table_html": table_html,
-            "download_url": download_url,
-            "plot_data_uri": None
-        }
-        return jsonify(response)
-
-    except Exception as e:
-        print("Summary endpoint error:", e, traceback.format_exc())
-        return jsonify({
-            "reply": "Failed to compute summary.",
-            "table_html": f"<pre>Error: {escape(str(e))}</pre>",
-            "plot_data_uri": None
-        }), 500
-
 @app.route('/memory/list', methods=['GET'])
 def memory_list():
     sid = (getattr(g, "sid", "") or request.args.get('sid') or "").strip()
@@ -1288,18 +1048,25 @@ def memory_list():
             cur = conn.cursor()
             cur.execute("PRAGMA table_info(chats);")
             cols = [r[1] for r in cur.fetchall()]
+
             if sid and 'session_id' in cols:
                 rows = cur.execute(
-                    "SELECT id, title, created_at FROM chats WHERE session_id = ? "
-                    "ORDER BY created_at DESC",
+                    "SELECT id, title, created_at FROM chats WHERE session_id = ? ORDER BY created_at DESC",
                     (sid,)
                 ).fetchall()
             else:
                 rows = cur.execute(
                     "SELECT id, title, created_at FROM chats ORDER BY created_at DESC"
                 ).fetchall()
+
         chats = [{"id": r[0], "title": r[1] or "Chat", "created_at": r[2]} for r in rows]
+
+        # ALWAYS include sample chat at top (even if user has no chats)
+        chats = [c for c in chats if c.get("id") != SAMPLE_CHAT_ID]
+        chats.insert(0, {"id": SAMPLE_CHAT_ID, "title": SAMPLE_CHAT_TITLE, "created_at": SAMPLE_CHAT_CREATED_AT})
+
         return jsonify({"chats": chats})
+
     except Exception as e:
         try:
             conv = _load_conversations()
@@ -1308,12 +1075,13 @@ def memory_list():
                 if sid:
                     if isinstance(v, dict) and v.get("session_id") and v.get("session_id") != sid:
                         continue
-                items.append({
-                    "id": k,
-                    "title": v.get("title") or "Chat",
-                    "created_at": v.get("created_at", 0)
-                })
+                items.append({"id": k, "title": v.get("title") or "Chat", "created_at": v.get("created_at", 0)})
+
             items.sort(key=lambda x: x['created_at'] or 0, reverse=True)
+
+            items = [c for c in items if c.get("id") != SAMPLE_CHAT_ID]
+            items.insert(0, {"id": SAMPLE_CHAT_ID, "title": SAMPLE_CHAT_TITLE, "created_at": SAMPLE_CHAT_CREATED_AT})
+
             return jsonify({"chats": items})
         except Exception:
             return jsonify({"error": f"Failed to list chats: {e}"}), 500
@@ -1324,15 +1092,20 @@ def memory_load():
     sid = (getattr(g, "sid", "") or (request.args.get('sid') or "")).strip()
     if not cid:
         return jsonify({"error": "Missing chat ID"}), 400
+
+    # ALWAYS return sample chat from code (never from DB), so it can’t get polluted by old messages
+    if cid == SAMPLE_CHAT_ID:
+        return jsonify(SAMPLE_CHAT)
+
     try:
         with sqlite3.connect(str(DB_PATH)) as conn:
             cur = conn.cursor()
             cur.execute("PRAGMA table_info(chats);")
             cols = [r[1] for r in cur.fetchall()]
+
             if sid and 'session_id' in cols:
                 row = cur.execute(
-                    "SELECT id, title, created_at, session_id, messages_json "
-                    "FROM chats WHERE id = ? AND session_id = ?",
+                    "SELECT id, title, created_at, session_id, messages_json FROM chats WHERE id = ? AND session_id = ?",
                     (cid, sid)
                 ).fetchone()
             else:
@@ -1340,6 +1113,7 @@ def memory_load():
                     "SELECT id, title, created_at, messages_json FROM chats WHERE id = ?",
                     (cid,)
                 ).fetchone()
+
         if not row:
             conv = _load_conversations()
             conv_row = conv.get(cid)
@@ -1348,9 +1122,11 @@ def memory_load():
                     return jsonify({"error": "Chat not found"}), 404
                 return jsonify(conv_row)
             return jsonify({"error": "Chat not found"}), 404
+
         conv = _row_to_conv(row)
         if sid and conv.get("session_id") and conv.get("session_id") != sid:
             return jsonify({"error": "Chat not found"}), 404
+
         return jsonify({
             "id": conv["id"],
             "title": conv.get("title") or "Chat",
@@ -1365,9 +1141,15 @@ def memory_save():
     payload = request.get_json(force=True) or {}
     sid = (getattr(g, "sid") or payload.get('sid') or "").strip()
     cid = payload.get('id') or f"chat-{int(time.time() * 1000)}"
+
+    # Block saving sample chat forever
+    if cid == SAMPLE_CHAT_ID:
+        return jsonify({"ok": True, "id": cid})
+
     title = payload.get('title') or 'Chat'
     created_at = payload.get('created_at') or int(time.time() * 1000)
     messages = payload.get('messages') or []
+
     ok = _save_conversation_single(cid, title, created_at, messages, session_id=sid)
     if not ok:
         return jsonify({"error": "Failed to save chat"}), 500
@@ -1376,18 +1158,12 @@ def memory_save():
 @app.route("/health", methods=["GET"])
 def health():
     try:
-        # Check DuckDB
-        con.execute("SELECT 1")
-        
-        # Check SQLite
+        with _get_duck_con() as local_con:
+            local_con.execute("SELECT 1")
         with sqlite3.connect(str(DB_PATH)) as conn:
             conn.execute("SELECT 1")
-        
-        # Check export folder exists
         EXPORT_DIR.mkdir(parents=True, exist_ok=True)
-
         return jsonify({"status": "ok"}), 200
-
     except Exception as e:
         return jsonify({"status": "error", "details": str(e)}), 500
 
@@ -1398,16 +1174,22 @@ def memory_delete():
     sid = (getattr(g, "sid", "") or payload.get('sid') or "").strip()
     if not cid:
         return jsonify({"error": "Missing chat ID"}), 400
+
+    if cid == SAMPLE_CHAT_ID:
+        return jsonify({"ok": False, "error": "Sample chat cannot be deleted"}), 400
+
     try:
         with sqlite3.connect(str(DB_PATH)) as conn:
             cur = conn.cursor()
             cur.execute("PRAGMA table_info(chats);")
             cols = [r[1] for r in cur.fetchall()]
+
             if sid and 'session_id' in cols:
                 cur.execute("DELETE FROM chats WHERE id = ? AND session_id = ?", (cid, sid))
             else:
                 cur.execute("DELETE FROM chats WHERE id = ?", (cid,))
             conn.commit()
+
         return jsonify({"ok": True})
     except Exception as e:
         try:
