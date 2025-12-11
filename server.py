@@ -31,6 +31,8 @@ DUCKDB_FILE = os.getenv("DUCKDB_FILE", "./data/sales.duckdb")
 CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4o-mini")
 PORT = int(os.getenv("PORT", "3000"))
 MAX_ROWS = int(os.getenv("MAX_ROWS", "5000"))
+QUERY_CACHE = {}      # { sql_text: { "response": result_dict, "time": timestamp } }
+CACHE_TTL = 30        # cache lifespan in seconds (you can increase to 60 if needed)
 
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY must be set in environment")
@@ -574,6 +576,12 @@ def handle_general_data_question(question: str, history=None):
     # 2) If NO_SQL → theory/general mode (conversation-aware)
     if not sql_text or sql_text.strip().upper() == "NO_SQL":
         return answer_theory_question(augmented_question)
+    cache_key = sql_text.strip()
+    cached = QUERY_CACHE.get(cache_key)
+    if cached:
+        if (time.time() - cached["time"]) < CACHE_TTL:
+            # return cached result immediately
+            return cached["response"]
 
     # 3) Normalize & re-check
     sql_text = sql_text.strip()
@@ -705,6 +713,13 @@ def handle_general_data_question(question: str, history=None):
     }
     if DEBUG_SQL:
         result["debug_sql"] = sql_text
+    try:
+        QUERY_CACHE[cache_key] = {
+            "response": result,
+            "time": time.time()
+        }
+    except Exception:
+        pass  # never allow caching to break the app
 
     return result
 
