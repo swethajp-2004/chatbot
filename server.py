@@ -32,7 +32,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 DUCKDB_FILE = os.getenv("DUCKDB_FILE", "./data/sales.duckdb")
 CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4o-mini")
 PORT = int(os.getenv("PORT", "3000"))
-MAX_ROWS = int(os.getenv("MAX_ROWS", "5000"))
+MAX_ROWS = int(os.getenv("MAX_ROWS", "500"))
 QUERY_CACHE = {}      # { sql_text: { "response": result_dict, "time": timestamp } }
 CACHE_TTL = 30        # cache lifespan in seconds (you can increase to 60 if needed)
 
@@ -1758,3 +1758,4 @@ if __name__ == "__main__":
         print("Route print failed:", e)
 
     app.run(host="0.0.0.0", port=PORT)
+
