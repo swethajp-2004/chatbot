@@ -361,6 +361,9 @@
     <!-- Sample Questions button -->
     <button id="sample-btn" class="provider-btn">Sample questions you can ask</button>
 
+    <!-- Prediction Questions button -->
+    <button id="predict-btn" class="provider-btn">Prediction questions you can ask</button>
+
     <div id="chats" class="chats"></div>
     <div style="font-size:0.8rem;color:#6b7280;margin-top:8px;">BundleAI can make mistakes. Check important information before using the answer.</div>
   </div>
@@ -394,12 +397,16 @@
   // Sample chat id must match server.py
   const SAMPLE_CHAT_ID = "sample-chat";
 
+  // ✅ UPDATED: Prediction chat id must match server.py (PRED_CHAT_ID)
+  const PREDICT_CHAT_ID = "predicted-chat";
+
   const chatsEl = document.getElementById('chats');
   const chatColumn = document.getElementById('chat-column');
   const input = document.getElementById('user-input');
   const sendBtn = document.getElementById('send-btn');
   const topHeader = document.getElementById('top-header');
   const sampleBtn = document.getElementById('sample-btn');
+  const predictBtn = document.getElementById('predict-btn');
 
   function formatDate(ts){ const d = new Date(Number(ts)); return isNaN(d.getTime()) ? '' : d.toLocaleString(); }
   function escapeHtml(s){ return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
@@ -440,7 +447,7 @@
     }
   }
 
-  // Render chat list (ephemeral filtered) + IMPORTANT: HIDE SAMPLE CHAT ITEM (so you don't see 2)
+  // Render chat list (ephemeral filtered) + IMPORTANT: HIDE SAMPLE/PREDICT CHAT ITEM (so you don't see 2)
   function renderChatList(){
     chatsEl.innerHTML = '';
     const list = Object.values(chatsIndex).sort((a,b)=> (b.created_at||0) - (a.created_at||0));
@@ -448,8 +455,9 @@
       if(!meta || !meta.id) return;
       if(ephemeralChats.has(meta.id)) return;
 
-      // ✅ DON’T render sample chat here — only access it via the button
+      // ✅ DON’T render sample/pred chats here — only access via the buttons
       if(meta.id === SAMPLE_CHAT_ID) return;
+      if(meta.id === PREDICT_CHAT_ID) return;
 
       const item = document.createElement('div');
       item.className = 'chat-item' + (meta.id===currentChatId ? ' active' : '');
@@ -513,10 +521,11 @@
     delBtn.title = 'Delete message';
     delBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M3 6h18" stroke="#f97373" stroke-width="1.6" stroke-linecap="round"/><path d="M8 6v12a2 2 0 0 0 2 2h4a2 2 0 0 0 2-2V6" stroke="#f97373" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/><path d="M10 6V4a2 2 0 0 1 2-2h0a2 2 0 0 1 2 2v2" stroke="#f97373" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>';
 
-    // Disable delete in sample chat
+    // Disable delete in sample + prediction chats
     delBtn.onclick = (ev) => {
       ev.stopPropagation();
       if(currentChatId === SAMPLE_CHAT_ID) return;
+      if(currentChatId === PREDICT_CHAT_ID) return;
       handleDelete(msg, index);
     };
 
@@ -524,7 +533,7 @@
     controls.appendChild(delBtn);
     wrapper.appendChild(controls);
 
-    const isSampleChat = (currentChatId === SAMPLE_CHAT_ID);
+    const isExampleChat = (currentChatId === SAMPLE_CHAT_ID) || (currentChatId === PREDICT_CHAT_ID);
 
     if(msg.role === 'user'){
       const content = document.createElement('div');
@@ -532,8 +541,8 @@
       content.innerText = msg.text || '';
       wrapper.appendChild(content);
 
-      // Run pill for sample questions only (and only if no bot immediately after)
-      if(isSampleChat && (msg.text || '').trim()){
+      // Run pill for example questions only (and only if no bot immediately after)
+      if(isExampleChat && (msg.text || '').trim()){
         const arr = messagesCache[currentChatId] || [];
         const hasBotAfter = (index + 1 < arr.length && arr[index + 1] && arr[index + 1].role === 'bot');
         if(!hasBotAfter){
@@ -605,8 +614,8 @@
     chatColumn.scrollTop = chatColumn.scrollHeight;
   }
 
-  // ✅ UPDATED: do NOT auto-open sample chat on load.
-  // Show normal chats list, and open the newest NON-SAMPLE chat if exists.
+  // ✅ do NOT auto-open sample chat on load.
+  // Show normal chats list, and open the newest NON-SAMPLE/NON-PRED chat if exists.
   async function loadChatsIndex(){
     try {
       const seen = getCookie('bundle_seen_before');
@@ -620,23 +629,23 @@
       if(j && Array.isArray(j.chats)){
         chatsIndex = {};
         j.chats.forEach(c => chatsIndex[c.id] = c);
-        // Always force sample chat meta so it never breaks / duplicates
+
+        // Always force sample/pred meta so it never breaks / duplicates
         chatsIndex[SAMPLE_CHAT_ID] = { id: SAMPLE_CHAT_ID, title: 'Sample Questions', created_at: 1700000000000 };
-        
-        // Always keep sample in index (but we hide it in the sidebar list)
-        if(!chatsIndex[SAMPLE_CHAT_ID]){
-          chatsIndex[SAMPLE_CHAT_ID] = { id: SAMPLE_CHAT_ID, title: 'Sample Questions', created_at: 1700000000000 };
-        }
+        chatsIndex[PREDICT_CHAT_ID] = { id: PREDICT_CHAT_ID, title: 'Predicted Questions', created_at: 1700000001000 };
 
         renderChatList();
 
-        // Auto-open the newest non-sample chat, if any
-        const nonSample = Object.values(chatsIndex).filter(x => x && x.id && x.id !== SAMPLE_CHAT_ID);
-        if(nonSample.length){
-          nonSample.sort((a,b)=> (b.created_at||0) - (a.created_at||0));
-          await loadConversation(nonSample[0].id);
+        // Auto-open the newest non-sample/non-pred chat, if any
+        const normalChats = Object.values(chatsIndex).filter(x =>
+          x && x.id && x.id !== SAMPLE_CHAT_ID && x.id !== PREDICT_CHAT_ID
+        );
+
+        if(normalChats.length){
+          normalChats.sort((a,b)=> (b.created_at||0) - (a.created_at||0));
+          await loadConversation(normalChats[0].id);
         } else {
-          // If user has no chats, keep empty screen until they click sample button or ask a question
+          // If user has no chats, keep empty screen until they click sample/prediction button or ask a question
           currentChatId = null;
           chatColumn.innerHTML = '';
           setTopHeaderTitle('BUNDLE AI');
@@ -667,28 +676,59 @@
     setTopHeaderTitle(showInList ? (chatsIndex[id].title) : 'New Chat');
   }
 
+  // ✅ FIX: bulletproof JSON handling so UI never goes blank if backend returns HTML/text
   async function loadConversation(id){
     try {
       const res = await fetch('/memory/load?id=' + encodeURIComponent(id) + '&sid=' + encodeURIComponent(SESSION_ID));
-      if(res.status===200){
-        const j = await res.json();
+
+      // Read raw text first (so we can debug if backend returns HTML)
+      const raw = await res.text();
+
+      if(res.status !== 200){
+        console.warn("loadConversation failed status=", res.status, "body=", raw);
+        renderChatList();
+        return;
+      }
+
+      let j;
+      try {
+        j = JSON.parse(raw);
+      } catch(parseErr){
+        console.error("loadConversation expected JSON but got:", raw.slice(0, 500));
+        // Show an error message in UI instead of a blank screen
         currentChatId = id;
-
-        // Sample chat should always show ONLY the preset sample questions
-        if (id === SAMPLE_CHAT_ID) {
-          messagesCache[id] = Array.isArray(j.messages) ? j.messages.slice(0) : [];
-        } else {
-          messagesCache[id] = j.messages || [];
-        }
-
-        chatsIndex[id] = { id, title: j.title || 'Chat', created_at: j.created_at || Date.now() };
-        ephemeralChats.delete(id);
+        messagesCache[id] = [{
+          role:'bot',
+          text:'⚠️ Server returned non-JSON response for this chat. Check backend route /memory/load.\n\nOpen browser console to see the raw response body.',
+          table_html:'',
+          plot_data_uri:null,
+          download_url:null,
+          time: Date.now()
+        }];
         renderChatList();
         renderMessagesForCurrentChat();
-        setTopHeaderTitle(chatsIndex[id].title);
-      } else {
-        renderChatList();
+        setTopHeaderTitle('Error');
+        return;
       }
+
+      currentChatId = id;
+
+      // Sample chat should always show ONLY the preset sample questions
+      if (id === SAMPLE_CHAT_ID) {
+        messagesCache[id] = Array.isArray(j.messages) ? j.messages.slice(0) : [];
+      } else if (id === PREDICT_CHAT_ID) {
+        // Predicted chat is served by backend too
+        messagesCache[id] = Array.isArray(j.messages) ? j.messages.slice(0) : [];
+      } else {
+        messagesCache[id] = j.messages || [];
+      }
+
+      chatsIndex[id] = { id, title: j.title || 'Chat', created_at: j.created_at || Date.now() };
+      ephemeralChats.delete(id);
+      renderChatList();
+      renderMessagesForCurrentChat();
+      setTopHeaderTitle(chatsIndex[id].title);
+
     } catch(e){
       console.warn('loadConversation err', e);
       renderChatList();
@@ -700,6 +740,9 @@
 
     // Do not save sample chat from client
     if(id === SAMPLE_CHAT_ID) return;
+
+    // Do not save predicted chat from client
+    if(id === PREDICT_CHAT_ID) return;
 
     const payload = {
       sid: SESSION_ID,
@@ -720,6 +763,7 @@
 
   async function deleteChat(id){
     if(id === SAMPLE_CHAT_ID) return;
+    if(id === PREDICT_CHAT_ID) return;
     if(!confirm('Delete this chat? This cannot be undone from the UI.')) return;
     try {
       const res = await fetch('/memory/delete', {
@@ -730,7 +774,8 @@
         delete chatsIndex[id];
         delete messagesCache[id];
         ephemeralChats.delete(id);
-        const keys = Object.keys(chatsIndex).filter(k=>k!==SAMPLE_CHAT_ID);
+
+        const keys = Object.keys(chatsIndex).filter(k => k !== SAMPLE_CHAT_ID && k !== PREDICT_CHAT_ID);
         if(keys.length) await loadConversation(keys[0]);
         else {
           currentChatId = null;
@@ -739,7 +784,7 @@
           setTopHeaderTitle('Bundle AI');
         }
       } else {
-        alert('Delete failed');
+        alert((j && j.error) ? j.error : 'Delete failed');
       }
     } catch(e){
       console.warn('deleteChat err', e);
@@ -749,6 +794,7 @@
 
   async function renameChat(id){
     if(id === SAMPLE_CHAT_ID) return;
+    if(id === PREDICT_CHAT_ID) return;
     const meta = chatsIndex[id] || {};
     const current = meta.title || '';
     const newTitle = prompt('Rename chat', current);
@@ -767,6 +813,7 @@
 
   async function handleDelete(msg, idx){
     if(currentChatId === SAMPLE_CHAT_ID) return;
+    if(currentChatId === PREDICT_CHAT_ID) return;
     if(!confirm('Delete this message?')) return;
     const arr = messagesCache[currentChatId] || [];
     if(!Array.isArray(arr)) return;
@@ -795,8 +842,8 @@
     const text = input.value.trim();
     if(!text) return;
 
-    // If currently in sample chat, create a real new ephemeral chat for user questions
-    if(currentChatId === SAMPLE_CHAT_ID){
+    // If currently in sample/pred chat, create a real new ephemeral chat for user questions
+    if(currentChatId === SAMPLE_CHAT_ID || currentChatId === PREDICT_CHAT_ID){
       await createNewChat(false);
     }
 
@@ -879,10 +926,10 @@
     }
   }
 
-  // Run a sample question and show answer in SAME PLACE (replace Run pill)
+  // Run a sample/prediction question and show answer in SAME PLACE (replace Run pill)
   async function runSampleAt(userMsgIndex){
     try{
-      if(currentChatId !== SAMPLE_CHAT_ID) return;
+      if(currentChatId !== SAMPLE_CHAT_ID && currentChatId !== PREDICT_CHAT_ID) return;
 
       const arr = messagesCache[currentChatId] || [];
       const msg = arr[userMsgIndex];
@@ -924,7 +971,7 @@
         body: JSON.stringify({
           message: question,
           sid: SESSION_ID,
-          chat_id:"sample-ephemeral",
+          chat_id: (currentChatId === SAMPLE_CHAT_ID) ? "sample-ephemeral" : "predict-ephemeral",
           history: historyForServer
         })
       });
@@ -972,11 +1019,41 @@
 
   sendBtn.addEventListener('click', sendMessage);
   input.addEventListener('keypress', (e) => { if(e.key === 'Enter') sendMessage(); });
+
   sampleBtn.addEventListener('click', async () => {
+    // DEBUG: prove /memory/load works for sample
+    try {
+      console.log("Sample clicked, id =", SAMPLE_CHAT_ID);
+      const r = await fetch('/memory/load?id=' + encodeURIComponent(SAMPLE_CHAT_ID) + '&sid=' + encodeURIComponent(SESSION_ID));
+      console.log("Sample direct fetch status:", r.status);
+      const t = await r.text();
+      console.log("Sample direct fetch body:", t);
+    } catch(e) {
+      console.warn("Sample direct fetch failed:", e);
+    }
+
     // Force a fresh reload every time (so it always shows again)
     delete messagesCache[SAMPLE_CHAT_ID];
     await loadConversation(SAMPLE_CHAT_ID);
   });
+
+  predictBtn.addEventListener('click', async () => {
+    // DEBUG: prove /memory/load works for predict
+    try {
+      console.log("Predict clicked, id =", PREDICT_CHAT_ID);
+      const r = await fetch('/memory/load?id=' + encodeURIComponent(PREDICT_CHAT_ID) + '&sid=' + encodeURIComponent(SESSION_ID));
+      console.log("Predict direct fetch status:", r.status);
+      const t = await r.text();
+      console.log("Predict direct fetch body:", t);
+    } catch(e) {
+      console.warn("Predict direct fetch failed:", e);
+    }
+
+    // Force a fresh reload every time
+    delete messagesCache[PREDICT_CHAT_ID];
+    await loadConversation(PREDICT_CHAT_ID);
+  });
+
   // initial load
   loadChatsIndex();
 </script>
