@@ -1,3 +1,4 @@
+# server.py
 import os
 import re
 import json
@@ -17,6 +18,7 @@ from pathlib import Path
 import sqlite3
 import datetime as dtmod
 from io import BytesIO  # in-memory Excel export
+from sklearn.linear_model import LinearRegression
 
 # CONFIG / ENV
 # -------------------------------------------------
@@ -88,6 +90,25 @@ SAMPLE_CHAT = {
     "created_at": SAMPLE_CHAT_CREATED_AT,
     "messages": SAMPLE_MESSAGES,
 }
+
+PRED_CHAT_ID = "predicted-chat"
+print(">>> IMPORTING SERVER FILE:", __file__)
+print(">>> PRED_CHAT_ID AT IMPORT:", PRED_CHAT_ID)
+
+PRED_CHAT_TITLE = "Predicted Questions"
+PRED_CHAT_CREATED_AT = 1700000001000
+
+PRED_MESSAGES = [
+  {"role":"bot","text":"Here are prediction sample questions. Click and press “Run this question”.","table_html":"","plot_data_uri":None,"download_url":None,"time":PRED_CHAT_CREATED_AT},
+  {"role":"user","text":"show me the total order,installation order,installation rate and estimated installation rate month wise for provider spectrum on 2025.","time":PRED_CHAT_CREATED_AT+1},
+  {"role":"user","text":"show me the total order,disconnection order,disconnection rate and estimated disconnection rate month wise for provider spectrum on 2025.","time":PRED_CHAT_CREATED_AT+2},
+  {"role":"user","text":"show me the total order,installation rate,disconnection rate and estimated installation rate, estimated disconnection rate month wise for provider spectrum on 2025.","time":PRED_CHAT_CREATED_AT+3},
+  {"role":"user","text":"show me the month wise profit rate and estimated profit rate for the product TV for 2025","time":PRED_CHAT_CREATED_AT+4},
+  {"role":"user","text":"show month wise revenue for the product tv and also estimate the revenue for 2025","time":PRED_CHAT_CREATED_AT+5},
+  {"role":"user","text":"what is the disconnected rate and estimated disconnected rate for the provider comcast for dec 2025.","time":PRED_CHAT_CREATED_AT+6},
+]
+
+PRED_CHAT = {"id":PRED_CHAT_ID,"title":PRED_CHAT_TITLE,"created_at":PRED_CHAT_CREATED_AT,"messages":PRED_MESSAGES}
 
 # DUCKDB CONNECTION
 # -------------------------------------------------
@@ -240,7 +261,8 @@ def is_safe_select(sql: str) -> bool:
 def strip_latex_math(text: str) -> str:
     """
     Convert common LaTeX math wrappers to plain text so frontend can read it.
-    Not a full LaTeX parser — just enough for \[ \], \( \), and simple \text{}.
+    Not a full LaTeX parser — just enough for \\[ \\], \\( \\), and simple \\text{}.
+    (NOTE: backslashes are doubled to avoid SyntaxWarning invalid escape sequences.)
     """
     if not text:
         return text
@@ -254,6 +276,7 @@ def strip_latex_math(text: str) -> str:
     t = t.replace("\\%", "%").replace("\\_", "_")
     t = re.sub(r"\n{3,}", "\n\n", t).strip()
     return t
+
 def classify_intent(question: str) -> str:
     q = (question or "").strip().lower()
     if not q:
@@ -284,6 +307,334 @@ def classify_intent(question: str) -> str:
     # everything else: treat as data question
     return "data_question"
 
+# -------------------------------------------------
+# PREDICTION HELPERS
+# -------------------------------------------------
+_PRED_WORDS = ("estimate", "estimated", "predict", "predicted", "prediction", "forecast", "projected", "projection")
+
+_MONTHS = {
+    "january": 1, "jan": 1,
+    "february": 2, "feb": 2,
+    "march": 3, "mar": 3,
+    "april": 4, "apr": 4,
+    "may": 5,
+    "june": 6, "jun": 6,
+    "july": 7, "jul": 7,
+    "august": 8, "aug": 8,
+    "september": 9, "sep": 9, "sept": 9,
+    "october": 10, "oct": 10,
+    "november": 11, "nov": 11,
+    "december": 12, "dec": 12,
+}
+
+def is_prediction_request(question: str) -> bool:
+    q = (question or "").lower()
+    return any(w in q for w in _PRED_WORDS)
+
+def extract_year(question: str):
+    m = re.search(r"\b(20\d{2})\b", (question or "").lower())
+    return int(m.group(1)) if m else None
+
+def extract_month_year(question: str):
+    """
+    Returns (year:int, month:int) if 'dec 2025' etc appears, else None.
+    """
+    q = (question or "").lower()
+    m = re.search(
+        r"\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b\D{0,15}\b(20\d{2})\b",
+        q
+    )
+    if not m:
+        return None
+    mon_txt = m.group(1)
+    year = int(m.group(2))
+    month = _MONTHS.get(mon_txt, None)
+    if not month:
+        month = _MONTHS.get(mon_txt[:3], None)
+    if not month:
+        return None
+    return (year, month)
+
+def _month_start_end(year: int, month: int):
+    start = dtmod.date(year, month, 1)
+    if month == 12:
+        end = dtmod.date(year + 1, 1, 1)
+    else:
+        end = dtmod.date(year, month + 1, 1)
+    return start, end
+
+# --- shared stopwords for entity extraction ---
+_ENTITY_STOPWORDS = (
+    "for|in|on|where|with|month|year|and|or|by|from|to|as|at|of|"
+    "what|whats|is|are|was|were|show|give|tell|find|get|calculate|compute|"
+    "profit|revenue|rate|orders|order|installation|install|disconnection|disconnect|"
+    "estimate|estimated|forecast|predict|predicted|projection|projected"
+)
+
+def extract_provider(question: str):
+    q = (question or "").strip()
+    # allow "provider spectrum" or "provider is spectrum" or "provider = spectrum"
+    m = re.search(
+        r"\bprovider\b\s*(?:is|=|:)?\s*([A-Za-z0-9&._\-/ ]{2,80})",
+        q,
+        flags=re.IGNORECASE
+    )
+    if not m:
+        return None
+    val = (m.group(1) or "").strip()
+
+    # cut at stopwords
+    val = re.split(rf"\b(?:{_ENTITY_STOPWORDS})\b", val, flags=re.IGNORECASE)[0].strip()
+
+    # keep only first chunk before punctuation that often continues sentence
+    val = re.split(r"[,.?;!]", val)[0].strip()
+
+    return val if val else None
+
+def extract_product(question: str):
+    q = (question or "").strip()
+    # allow "product tv" or "product is tv" or "product = tv"
+    m = re.search(
+        r"\bproduct\b\s*(?:is|=|:)?\s*([A-Za-z0-9&._\-/ ]{2,80})",
+        q,
+        flags=re.IGNORECASE
+    )
+    if not m:
+        return None
+    val = (m.group(1) or "").strip()
+
+    # cut at stopwords
+    val = re.split(rf"\b(?:{_ENTITY_STOPWORDS})\b", val, flags=re.IGNORECASE)[0].strip()
+    val = re.split(r"[,.?;!]", val)[0].strip()
+
+    return val if val else None
+
+def _safe_sql_literal(s: str) -> str:
+    return "'" + (s or "").replace("'", "''").strip() + "'"
+
+def _wants_estimate_for_metric(q_lower: str, metric_name: str) -> bool:
+    """
+    True ONLY if estimate/forecast word is NEAR the metric
+    (e.g. 'estimated installation rate', 'forecast profit')
+    """
+    est_words = r"(estimate|estimated|forecast|predict|predicted|projection|projected)"
+    m = re.escape(metric_name)
+
+    patterns = [
+        # estimated <metric>
+        rf"\b{est_words}\b\s+(?:\w+\s+){{0,2}}{m}\b",
+        # <metric> estimated
+        rf"\b{m}\b\s+(?:\w+\s+){{0,2}}{est_words}\b",
+    ]
+    return any(re.search(p, q_lower) for p in patterns)
+
+def _wants_any_estimates(q_lower: str) -> bool:
+    return any(w in q_lower for w in _PRED_WORDS)
+
+def build_prediction_monthly_sql(question: str):
+    """
+    Stable month-wise SQL for prediction mode.
+    Uses your real columns:
+      - SaleDate for month
+      - ConfirmedOrder, InstalledOrder, DisconnectDate
+      - NetAfterChargeback (revenue), Profit
+    Also supports generic filters like:
+      package xyz, mainchannel digital, marketing source google, companystate ca, etc.
+    """
+    year = extract_year(question)
+    month_year = extract_month_year(question)  # (y,m) or None
+
+    provider = extract_provider(question)
+    product = extract_product(question)
+
+    # generic filters: "<colname> is/=/: <value>"
+    q = (question or "").strip()
+
+    generic_filters = []
+    try:
+        pattern = re.compile(
+            r"\b([A-Za-z_][A-Za-z0-9_]{1,50})\b\s*(?:=|:|\bis\b)\s*([A-Za-z0-9&._\-#/ ]{2,60})",
+            flags=re.IGNORECASE
+        )
+
+        stop_words = set(["for", "in", "on", "where", "with", "month", "year", "and", "or"])
+
+        for m in pattern.finditer(q):
+            col_raw = (m.group(1) or "").strip()
+            val_raw = (m.group(2) or "").strip()
+
+            col = next((c for c in COLS if c.lower() == col_raw.lower()), None)
+            if not col:
+                continue
+
+            parts = val_raw.split()
+            cleaned = []
+            for p in parts:
+                if p.lower() in stop_words:
+                    break
+                cleaned.append(p)
+            val = " ".join(cleaned).strip()
+
+            if not val:
+                continue
+
+            generic_filters.append((col, val))
+    except Exception:
+        generic_filters = []
+
+    # date range
+    if month_year:
+        y, m = month_year
+        start_m, end_m = _month_start_end(y, m)
+        train_start = start_m - dtmod.timedelta(days=365)
+        date_start = train_start
+        date_end = end_m
+        target_filter = ("month", y, m)
+    else:
+        if not year:
+            year = dtmod.date.today().year
+        date_start = dtmod.date(year - 1, 1, 1)
+        date_end = dtmod.date(year + 1, 1, 1)
+        target_filter = ("year", year)
+
+    where = []
+    where.append(f"CAST(SaleDate AS DATE) >= DATE '{date_start.isoformat()}'")
+    where.append(f"CAST(SaleDate AS DATE) <  DATE '{date_end.isoformat()}'")
+
+    if provider:
+        where.append(
+            f"LOWER(TRIM(CAST(ProviderName AS VARCHAR))) LIKE '%' || LOWER(TRIM({_safe_sql_literal(provider)})) || '%'"
+        )
+
+    if product:
+        where.append(
+            f"LOWER(TRIM(CAST(ProductName AS VARCHAR))) LIKE '%' || LOWER(TRIM({_safe_sql_literal(product)})) || '%'"
+        )
+
+    for col, val in generic_filters:
+        if col.lower() in ("providername", "productname"):
+            continue
+        where.append(
+            f"LOWER(TRIM(CAST({qident(col)} AS VARCHAR))) LIKE '%' || LOWER(TRIM({_safe_sql_literal(val)})) || '%'"
+        )
+
+    where_sql = " AND ".join(where) if where else "1=1"
+
+    sql = f"""
+SELECT
+  STRFTIME('%Y-%m', CAST(SaleDate AS DATE)) AS month,
+
+  SUM(CASE WHEN COALESCE(ConfirmedOrder,0)=1 THEN 1 ELSE 0 END) AS total_orders,
+
+  SUM(CASE WHEN COALESCE(InstalledOrder,0)=1 THEN 1 ELSE 0 END) AS installation_orders,
+  ROUND(
+    SUM(CASE WHEN COALESCE(InstalledOrder,0)=1 THEN 1 ELSE 0 END) * 100.0 /
+    NULLIF(SUM(CASE WHEN COALESCE(ConfirmedOrder,0)=1 THEN 1 ELSE 0 END), 0),
+    2
+  ) AS installation_rate,
+
+  SUM(CASE WHEN TRY_CAST(DisconnectDate AS TIMESTAMP) IS NOT NULL THEN 1 ELSE 0 END) AS disconnection_orders,
+  ROUND(
+    SUM(CASE WHEN TRY_CAST(DisconnectDate AS TIMESTAMP) IS NOT NULL THEN 1 ELSE 0 END) * 100.0 /
+    NULLIF(SUM(CASE WHEN COALESCE(ConfirmedOrder,0)=1 THEN 1 ELSE 0 END), 0),
+    2
+  ) AS disconnection_rate,
+
+  SUM(COALESCE(NetAfterChargeback,0)) AS revenue,
+  SUM(COALESCE(Profit,0)) AS profit,
+
+  ROUND(
+    SUM(COALESCE(Profit,0)) * 100.0 /
+    NULLIF(SUM(COALESCE(NetAfterChargeback,0)), 0),
+    2
+  ) AS profit_rate
+
+FROM {TABLE}
+WHERE {where_sql}
+GROUP BY 1
+ORDER BY 1
+""".strip()
+
+    return sql, target_filter
+
+def _month_to_index(ym: str) -> int:
+    try:
+        y, m = ym.split("-")
+        return int(y) * 12 + (int(m) - 1)
+    except Exception:
+        return None
+
+def add_estimated_columns(df: pd.DataFrame, cols_to_estimate, window=12):
+    """
+    Adds estimated_<col> using rolling Linear Regression.
+    Predicts each month using ONLY previous months.
+    """
+    if df is None or df.empty or "month" not in df.columns:
+        return df
+
+    df = df.copy()
+    df["__t"] = df["month"].astype(str).apply(_month_to_index)
+    df = df.sort_values("__t").reset_index(drop=True)
+
+    for col in cols_to_estimate:
+        est_col = f"estimated_{col}"
+        df[est_col] = np.nan
+        if col not in df.columns:
+            continue
+
+        y_all = pd.to_numeric(df[col], errors="coerce").values
+        t_all = df["__t"].values
+
+        for i in range(len(df)):
+            start_i = max(0, i - window)
+            X_hist = t_all[start_i:i]
+            y_hist = y_all[start_i:i]
+
+            mask = np.isfinite(X_hist) & np.isfinite(y_hist)
+            X_hist = X_hist[mask]
+            y_hist = y_hist[mask]
+
+            if len(X_hist) < 3:
+                continue
+
+            model = LinearRegression()
+            model.fit(X_hist.reshape(-1, 1), y_hist)
+
+            t_pred = t_all[i]
+            if not np.isfinite(t_pred):
+                continue
+
+            pred = model.predict(np.array([[t_pred]]))[0]
+            df.loc[i, est_col] = float(pred)
+
+        df[est_col] = pd.to_numeric(df[est_col], errors="coerce").round(2)
+
+    df.drop(columns=["__t"], inplace=True, errors="ignore")
+    return df
+
+def _explain_trend(df: pd.DataFrame, est_col: str, window: int):
+    vals = pd.to_numeric(df[est_col], errors="coerce").dropna().values
+    if len(vals) < 2:
+        return None
+    delta = vals[-1] - vals[-2]
+    if abs(delta) < 0.01:
+        direction = "stable"
+    elif delta > 0:
+        direction = "increasing"
+    else:
+        direction = "decreasing"
+    return f"- {est_col.replace('estimated_', '').replace('_', ' ').title()} estimate is {direction} based on the recent {window} months trend."
+
+def build_prediction_reply(df_out: pd.DataFrame, cols_to_estimate, window: int):
+    lines = []
+    lines.append(f"Estimates are generated using rolling Linear Regression on the previous {window} months (past data only).")
+    for col in cols_to_estimate:
+        est_col = f"estimated_{col}"
+        if est_col in df_out.columns:
+            t = _explain_trend(df_out, est_col, window)
+            if t:
+                lines.append(t)
+    return "\n".join(lines)
 
 # LLM HELPERS
 # -------------------------------------------------
@@ -321,7 +672,6 @@ def ask_model_for_sql(question: str, schema_cols: list, sample_rows: pd.DataFram
         )
         extra_semantics = "\n".join(semantic_lines)
 
-        # IMPORTANT: rf""" ... """ avoids Python invalid-escape warnings like \[
         prompt = rf"""
 You are an assistant that generates DuckDB SQL for a single table called {TABLE}.
 
@@ -372,7 +722,7 @@ Technical rules:
   • the identifying column(s) (e.g. ProviderName, MainChannel, Package), AND
   • the metric column(s) you are using (Profit, Revenue, EstimatedCommission, COUNT(*) AS orders, etc.)
   in the SELECT list.
-
+- IMPORTANT: If the user asks for estimate/prediction/forecast/projected values, return NO_SQL.
 - If the question wants raw row details (not aggregation), include LIMIT {MAX_ROWS}, unless the user explicitly asks for "all ...".
 - If the question is purely conceptual/theory (definitions, explanations) without needing actual table values, return NO_SQL.
 
@@ -398,16 +748,12 @@ Now output either:
         )
 
         sql = (response.choices[0].message.content or "").strip()
-
-        # Strip code fences if model added them
         sql = re.sub(r"^```(?:sql)?\s*|\s*```$", "", sql, flags=re.IGNORECASE).strip()
 
         if sql.upper() == "NO_SQL":
             return "NO_SQL"
-
         if not is_safe_select(sql):
             return "NO_SQL"
-
         return sql
 
     except Exception as e:
@@ -518,11 +864,177 @@ def handle_general_data_question(question: str, history=None):
     schema_cols = COLS
     qlow = (question or "").lower()
 
+    # -------------------------------------------------
+    # PREDICTION MODE (bypass LLM SQL and do stable month-wise SQL + ML)
+    # -------------------------------------------------
+    prediction_mode = is_prediction_request(question)
+    if prediction_mode:
+        try:
+            pred_sql, target_filter = build_prediction_monthly_sql(question)
+            df = run_sql_and_fetch_df(pred_sql)
+
+            ql = (question or "").lower()
+            cols_to_estimate = []
+
+            # Map metric display names to df column names
+            # IMPORTANT: keep "profit rate" BEFORE "profit" to avoid wrong matching
+            metric_map = {
+                "total orders": "total_orders",
+                "total order": "total_orders",
+
+                "installation orders": "installation_orders",
+                "installation order": "installation_orders",
+                "installed orders": "installation_orders",
+                "installed order": "installation_orders",
+
+                "installation rate": "installation_rate",
+                "install rate": "installation_rate",
+
+                "disconnection orders": "disconnection_orders",
+                "disconnection order": "disconnection_orders",
+                "disconnected orders": "disconnection_orders",
+                "disconnected order": "disconnection_orders",
+
+                "disconnection rate": "disconnection_rate",
+                "disconnect rate": "disconnection_rate",
+                "disconnected rate": "disconnection_rate",
+
+                "profit rate": "profit_rate",
+                "profit": "profit",
+                "revenue": "revenue",
+            }
+
+            # Only estimate metrics the user EXPLICITLY requested as estimated/forecast/predicted
+            for phrase, col in metric_map.items():
+                if _wants_estimate_for_metric(ql, phrase):
+                    cols_to_estimate.append(col)
+
+            # dedupe cols_to_estimate (prevents repeated trend lines)
+            cols_to_estimate = list(dict.fromkeys(cols_to_estimate))
+
+            # If user asked for estimates generally but didn't specify metric: conservative fallback
+            if not cols_to_estimate and _wants_any_estimates(ql):
+                if "installation rate" in ql or "install rate" in ql:
+                    cols_to_estimate = ["installation_rate"]
+                elif "disconnection rate" in ql or "disconnect rate" in ql or "disconnected rate" in ql:
+                    cols_to_estimate = ["disconnection_rate"]
+                elif "profit rate" in ql:
+                    cols_to_estimate = ["profit_rate"]
+                elif "profit" in ql:
+                    cols_to_estimate = ["profit"]
+                elif "order" in ql or "orders" in ql:
+                    cols_to_estimate = ["total_orders"]
+                else:
+                    cols_to_estimate = ["installation_rate"]
+
+            window = 12
+            df2 = add_estimated_columns(df, cols_to_estimate, window=window)
+
+            # Filter output to target (month or year)
+            df_out = df2.copy()
+            if isinstance(target_filter, tuple) and target_filter[0] == "month":
+                _, y, m = target_filter
+                key = f"{y:04d}-{m:02d}"
+                df_out = df_out[df_out["month"].astype(str) == key]
+            elif isinstance(target_filter, tuple) and target_filter[0] == "year":
+                _, y = target_filter
+                df_out = df_out[df_out["month"].astype(str).str.startswith(f"{y:04d}-")]
+
+            # --------- OUTPUT COLUMN SELECTION (FIXED: no extra columns) ----------
+            wants_total_orders = ("total order" in ql) or ("total orders" in ql) or bool(re.search(r"\btotal\s+orders?\b", ql))
+
+            wants_install_orders = any(p in ql for p in ["installation order", "installation orders", "installed order", "installed orders"])
+            wants_install_rate = any(p in ql for p in ["installation rate", "install rate"])
+
+            wants_disc_orders = any(p in ql for p in ["disconnection order", "disconnection orders", "disconnected order", "disconnected orders"])
+            wants_disc_rate = any(p in ql for p in ["disconnection rate", "disconnect rate", "disconnected rate"])
+
+            wants_revenue = "revenue" in ql
+            wants_profit = ("profit" in ql)  # includes profit rate too
+            wants_profit_rate = ("profit rate" in ql)
+
+            base_cols = ["month"]
+
+            # total orders (only if asked OR if its estimate is requested)
+            if wants_total_orders or ("total_orders" in cols_to_estimate):
+                base_cols += ["total_orders"]
+                if "total_orders" in cols_to_estimate:
+                    base_cols += ["estimated_total_orders"]
+
+            # installation orders (only if asked OR estimate requested)
+            if wants_install_orders or ("installation_orders" in cols_to_estimate):
+                base_cols += ["installation_orders"]
+                if "installation_orders" in cols_to_estimate:
+                    base_cols += ["estimated_installation_orders"]
+
+            # installation rate (only if asked OR estimate requested)
+            if wants_install_rate or ("installation_rate" in cols_to_estimate):
+                base_cols += ["installation_rate"]
+                if "installation_rate" in cols_to_estimate:
+                    base_cols += ["estimated_installation_rate"]
+
+            # disconnection orders (only if asked OR estimate requested)
+            if wants_disc_orders or ("disconnection_orders" in cols_to_estimate):
+                base_cols += ["disconnection_orders"]
+                if "disconnection_orders" in cols_to_estimate:
+                    base_cols += ["estimated_disconnection_orders"]
+
+            # disconnection rate (only if asked OR estimate requested)
+            if wants_disc_rate or ("disconnection_rate" in cols_to_estimate):
+                base_cols += ["disconnection_rate"]
+                if "disconnection_rate" in cols_to_estimate:
+                    base_cols += ["estimated_disconnection_rate"]
+
+            # revenue (only if asked OR estimate requested)
+            if wants_revenue or ("revenue" in cols_to_estimate):
+                base_cols += ["revenue"]
+                if "revenue" in cols_to_estimate:
+                    base_cols += ["estimated_revenue"]
+
+            # profit (only if asked OR estimate requested)
+            if (wants_profit and not wants_profit_rate) or ("profit" in cols_to_estimate):
+                # if user only asked profit rate, don't force profit unless estimated profit requested
+                base_cols += ["profit"]
+                if "profit" in cols_to_estimate:
+                    base_cols += ["estimated_profit"]
+
+            # profit rate (only if asked OR estimate requested)
+            if wants_profit_rate or ("profit_rate" in cols_to_estimate):
+                base_cols += ["profit_rate"]
+                if "profit_rate" in cols_to_estimate:
+                    base_cols += ["estimated_profit_rate"]
+
+            # dedupe while preserving order and keep only existing cols
+            seen = set()
+            final_cols = []
+            for c in base_cols:
+                if c in df_out.columns and c not in seen:
+                    final_cols.append(c)
+                    seen.add(c)
+
+            df_out = df_out[final_cols] if final_cols else df_out
+
+            table_html = rows_to_html_table(df_out.to_dict(orient="records")) if not df_out.empty else "<p><i>No data</i></p>"
+            reply_text = build_prediction_reply(df_out, cols_to_estimate, window=window)
+
+            result = {
+                "reply": reply_text,
+                "table_html": table_html,
+                "plot_data_uri": None,
+                "rows_returned": int(len(df_out)),
+                "truncated": False,
+                "download_url": None,
+            }
+            return result
+
+        except Exception as e:
+            _log_and_mask_error(e, "prediction_mode")
+            return _safe_user_error("Prediction failed due to an internal error. Please try again with fewer filters.")
+
     # --- conversation-aware context ---
     history = history or []
     if history:
         ctx_lines = []
-        # keep last 6 messages to stay small
         for m in history[-6:]:
             role = m.get("role", "").upper()
             content = (m.get("content") or "").strip()
@@ -551,7 +1063,6 @@ def handle_general_data_question(question: str, history=None):
         qlow
     )
 
-    # If user used relative time ("last year", "this month") OR mentioned a month with no year, ask for clarification
     if rel_time or (month_name and not has_year):
         msg = (
             "To answer this accurately I need a specific year or month-year. "
@@ -576,11 +1087,11 @@ def handle_general_data_question(question: str, history=None):
     # 2) If NO_SQL → theory/general mode (conversation-aware)
     if not sql_text or sql_text.strip().upper() == "NO_SQL":
         return answer_theory_question(augmented_question)
+
     cache_key = sql_text.strip()
     cached = QUERY_CACHE.get(cache_key)
     if cached:
         if (time.time() - cached["time"]) < CACHE_TTL:
-            # return cached result immediately
             return cached["response"]
 
     # 3) Normalize & re-check
@@ -719,7 +1230,7 @@ def handle_general_data_question(question: str, history=None):
             "time": time.time()
         }
     except Exception:
-        pass  # never allow caching to break the app
+        pass
 
     return result
 
@@ -732,6 +1243,15 @@ SESSION_COOKIE_TTL_DAYS = 365 * 2
 
 def _make_sid():
     return uuid.uuid4().hex
+
+@app.route("/debug", methods=["GET"], strict_slashes=False)
+def debug():
+    return jsonify({
+        "server_file": __file__,
+        "PRED_CHAT_ID": PRED_CHAT_ID,
+        "SAMPLE_CHAT_ID": SAMPLE_CHAT_ID,
+        "routes": sorted([str(r) for r in app.url_map.iter_rules()])
+    })
 
 @app.before_request
 def ensure_sid_cookie():
@@ -774,11 +1294,11 @@ def set_sid_cookie(response):
         pass
     return response
 
-@app.route('/')
+@app.route('/', methods=["GET"], strict_slashes=False)
 def index():
     return send_from_directory('.', 'index.html')
 
-@app.route('/chat', methods=['POST'])
+@app.route('/chat', methods=['POST'], strict_slashes=False)
 def chat():
     payload = request.json or {}
     question = (payload.get('message') or "").strip()
@@ -826,8 +1346,7 @@ def chat():
 
     intent = classify_intent(question)
 
-    # IMPORTANT: no "Hi!" auto message (you said you don't want it)
-        # Smalltalk
+    # Smalltalk
     if intent == "smalltalk":
         return jsonify({
             "reply": "Hello 👋 I’m BundleAI. Ask me anything about your dataset — or click “Sample questions you can ask” to run examples.",
@@ -871,7 +1390,7 @@ def chat():
 # -------------------------------------------------
 # DOWNLOAD ENDPOINT FOR EXCEL (in-memory only)
 # -------------------------------------------------
-@app.route("/download/<token>")
+@app.route("/download/<token>", methods=["GET"], strict_slashes=False)
 def download_result(token):
     data = EXPORT_CACHE.get(token)
     if data is None:
@@ -1055,7 +1574,7 @@ def _save_conversation_single(chat_id, title, created_at, messages, session_id="
         except Exception:
             return False
 
-@app.route('/memory/list', methods=['GET'])
+@app.route('/memory/list', methods=['GET'], strict_slashes=False)
 def memory_list():
     sid = (getattr(g, "sid", "") or request.args.get('sid') or "").strip()
     try:
@@ -1079,7 +1598,7 @@ def memory_list():
         # ALWAYS include sample chat at top (even if user has no chats)
         chats = [c for c in chats if c.get("id") != SAMPLE_CHAT_ID]
         chats.insert(0, {"id": SAMPLE_CHAT_ID, "title": SAMPLE_CHAT_TITLE, "created_at": SAMPLE_CHAT_CREATED_AT})
-
+        chats.insert(1, {"id": PRED_CHAT_ID, "title": PRED_CHAT_TITLE, "created_at": PRED_CHAT_CREATED_AT})
         return jsonify({"chats": chats})
 
     except Exception as e:
@@ -1093,25 +1612,31 @@ def memory_list():
                 items.append({"id": k, "title": v.get("title") or "Chat", "created_at": v.get("created_at", 0)})
 
             items.sort(key=lambda x: x['created_at'] or 0, reverse=True)
-
             items = [c for c in items if c.get("id") != SAMPLE_CHAT_ID]
             items.insert(0, {"id": SAMPLE_CHAT_ID, "title": SAMPLE_CHAT_TITLE, "created_at": SAMPLE_CHAT_CREATED_AT})
+            items.insert(1, {"id": PRED_CHAT_ID, "title": PRED_CHAT_TITLE, "created_at": PRED_CHAT_CREATED_AT})
 
             return jsonify({"chats": items})
         except Exception:
             return jsonify({"error": f"Failed to list chats: {e}"}), 500
 
-@app.route('/memory/load', methods=['GET'])
+@app.route('/memory/load', methods=['GET'], strict_slashes=False)
 def memory_load():
     cid = (request.args.get('id') or "").strip()
     sid = (getattr(g, "sid", "") or (request.args.get('sid') or "")).strip()
+
     if not cid:
         return jsonify({"error": "Missing chat ID"}), 400
 
-    # ALWAYS return sample chat from code (never from DB), so it can’t get polluted by old messages
+    # Always serve sample + predicted chats from code (never DB)
     if cid == SAMPLE_CHAT_ID:
         return jsonify(SAMPLE_CHAT)
 
+    # bulletproof: accept both spellings just in case
+    if cid in (PRED_CHAT_ID, "predicted-chat", "predict-samples", "predicted-questions"):
+        return jsonify(PRED_CHAT)
+
+    # normal chats from DB
     try:
         with sqlite3.connect(str(DB_PATH)) as conn:
             cur = conn.cursor()
@@ -1130,15 +1655,10 @@ def memory_load():
                 ).fetchone()
 
         if not row:
-            conv = _load_conversations()
-            conv_row = conv.get(cid)
-            if conv_row:
-                if sid and conv_row.get("session_id") and conv_row.get("session_id") != sid:
-                    return jsonify({"error": "Chat not found"}), 404
-                return jsonify(conv_row)
             return jsonify({"error": "Chat not found"}), 404
 
         conv = _row_to_conv(row)
+
         if sid and conv.get("session_id") and conv.get("session_id") != sid:
             return jsonify({"error": "Chat not found"}), 404
 
@@ -1148,17 +1668,17 @@ def memory_load():
             "created_at": conv.get("created_at", 0),
             "messages": conv.get("messages", [])
         })
+
     except Exception as e:
         return jsonify({"error": f"Failed to load chat: {e}"}), 500
 
-@app.route('/memory/save', methods=['POST'])
+@app.route('/memory/save', methods=['POST'], strict_slashes=False)
 def memory_save():
     payload = request.get_json(force=True) or {}
     sid = (getattr(g, "sid") or payload.get('sid') or "").strip()
     cid = payload.get('id') or f"chat-{int(time.time() * 1000)}"
 
-    # Block saving sample chat forever
-    if cid == SAMPLE_CHAT_ID:
+    if cid in (SAMPLE_CHAT_ID, PRED_CHAT_ID):
         return jsonify({"ok": True, "id": cid})
 
     title = payload.get('title') or 'Chat'
@@ -1170,7 +1690,7 @@ def memory_save():
         return jsonify({"error": "Failed to save chat"}), 500
     return jsonify({"ok": True, "id": cid})
 
-@app.route("/health", methods=["GET"])
+@app.route("/health", methods=["GET"], strict_slashes=False)
 def health():
     try:
         with _get_duck_con() as local_con:
@@ -1182,7 +1702,7 @@ def health():
     except Exception as e:
         return jsonify({"status": "error", "details": str(e)}), 500
 
-@app.route('/memory/delete', methods=['POST'])
+@app.route('/memory/delete', methods=['POST'], strict_slashes=False)
 def memory_delete():
     payload = request.get_json(force=True) or {}
     cid = payload.get('id')
@@ -1190,8 +1710,9 @@ def memory_delete():
     if not cid:
         return jsonify({"error": "Missing chat ID"}), 400
 
-    if cid == SAMPLE_CHAT_ID:
-        return jsonify({"ok": False, "error": "Sample chat cannot be deleted"}), 400
+    # Block deleting sample + predicted chats forever
+    if cid in (SAMPLE_CHAT_ID, PRED_CHAT_ID):
+        return jsonify({"ok": False, "error": "This chat cannot be deleted"}), 400
 
     try:
         with sqlite3.connect(str(DB_PATH)) as conn:
@@ -1224,4 +1745,16 @@ def memory_delete():
 # MAIN
 if __name__ == "__main__":
     print(f"Starting server on http://localhost:{PORT} — using table {TABLE}")
+    print(">>> SERVER STARTED FROM FILE:", __file__)
+    print(">>> PRED_CHAT_ID IS:", PRED_CHAT_ID)
+
+    # print routes at startup so you can confirm /memory/load is registered
+    try:
+        print("=== ROUTES REGISTERED ===")
+        for r in sorted(app.url_map.iter_rules(), key=lambda x: str(x)):
+            print(r)
+        print("=========================")
+    except Exception as e:
+        print("Route print failed:", e)
+
     app.run(host="0.0.0.0", port=PORT)
