@@ -32,7 +32,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 DUCKDB_FILE = os.getenv("DUCKDB_FILE", "./data/sales.duckdb")
 CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4o-mini")
 PORT = int(os.getenv("PORT", "3000"))
-MAX_ROWS = int(os.getenv("MAX_ROWS", "500"))
+MAX_ROWS = int(os.getenv("MAX_ROWS", "2000"))
 QUERY_CACHE = {}      # { sql_text: { "response": result_dict, "time": timestamp } }
 CACHE_TTL = 30        # cache lifespan in seconds (you can increase to 60 if needed)
 
@@ -101,8 +101,8 @@ PRED_CHAT_CREATED_AT = 1700000001000
 PRED_MESSAGES = [
   {"role":"bot","text":"Here are prediction sample questions. Click and press “Run this question”.","table_html":"","plot_data_uri":None,"download_url":None,"time":PRED_CHAT_CREATED_AT},
   {"role":"user","text":"show me the total order,installation order,installation rate and estimated installation rate month wise for provider spectrum on 2025.","time":PRED_CHAT_CREATED_AT+1},
-  {"role":"user","text":"show me the total order,disconnection order,disconnection rate and estimated disconnection rate month wise for provider spectrum on 2025.","time":PRED_CHAT_CREATED_AT+2},
-  {"role":"user","text":"show me the total order,installation rate,disconnection rate and estimated installation rate, estimated disconnection rate month wise for provider spectrum on 2025.","time":PRED_CHAT_CREATED_AT+3},
+  {"role":"user","text":"show me the disconnection rate and estimated disconnection rate month wise for provider spectrum on 2025.","time":PRED_CHAT_CREATED_AT+2},
+  {"role":"user","text":"show me the installation rate,disconnection rate and estimated installation rate, estimated disconnection rate month wise for provider spectrum on 2025.","time":PRED_CHAT_CREATED_AT+3},
   {"role":"user","text":"show me the month wise profit rate and estimated profit rate for the product TV for 2025","time":PRED_CHAT_CREATED_AT+4},
   {"role":"user","text":"show month wise revenue for the product tv and also estimate the revenue for 2025","time":PRED_CHAT_CREATED_AT+5},
   {"role":"user","text":"what is the disconnected rate and estimated disconnected rate for the provider comcast for dec 2025.","time":PRED_CHAT_CREATED_AT+6},
@@ -254,6 +254,105 @@ def is_safe_select(sql: str) -> bool:
         if re.search(rf"\b{w}\b", sql_clean, flags=re.IGNORECASE):
             return False
     return True
+# Columns to hide by default in table output + excel download
+HIDDEN_COLS_DEFAULT = {
+    "CompanyKey",
+    "AffiliateCompanyKey",
+    "CustomerKey",
+    "CampaignPhoneKey",
+    "OrderItemKey",
+}
+
+def _normalize_colname(s: str) -> str:
+    return (s or "").strip().lower()
+
+def _hidden_cols_user_requested(question: str):
+    """
+    Return a set of hidden column names that the user explicitly mentioned.
+    Handles: CompanyKey, company key, company_key, etc.
+    """
+    q = (question or "").lower()
+    q_norm = _norm_key(q)  # remove spaces/punct
+
+    hits = set()
+    for c in HIDDEN_COLS_DEFAULT:
+        c_norm = _norm_key(c)              # "CompanyKey" -> "companykey"
+        c_spaced = _split_camel(c).lower() # "CompanyKey" -> "company key"
+
+        if c_norm and c_norm in q_norm:
+            hits.add(c)
+            continue
+
+        if c_spaced and c_spaced in q:
+            hits.add(c)
+            continue
+
+    return hits
+
+def apply_hidden_cols_policy(df: pd.DataFrame, question: str) -> pd.DataFrame:
+    """
+    Default: remove hidden cols.
+    Exception: if user asked for a hidden col, keep that one.
+    """
+    if df is None or df.empty:
+        return df
+
+    requested = _hidden_cols_user_requested(question)
+    # Hide all default hidden cols EXCEPT the ones explicitly requested
+    to_drop = [c for c in HIDDEN_COLS_DEFAULT if c in df.columns and c not in requested]
+    if to_drop:
+        return df.drop(columns=to_drop, errors="ignore")
+    return df
+
+def _extract_key_lookup(question: str):
+    """
+    Detect queries like:
+      - 'details of the company key <uuid> limit 5'
+      - 'show details for customerkey <uuid>'
+      - 'orderitemkey 12345 details'
+    Returns (col, value, limit) or (None, None, None)
+    """
+    q = (question or "").strip()
+    ql = q.lower()
+
+    # limit (default 50 for safety)
+    lim = 50
+    mlim = re.search(r"\blimit\s+(\d{1,5})\b", ql)
+    if mlim:
+        lim = max(1, min(int(mlim.group(1)), MAX_ROWS))
+
+    # find which hidden key column user mentioned (supports: company key / companykey / company_key)
+    hit_col = None
+    q_norm = _norm_key(ql)
+    for c in HIDDEN_COLS_DEFAULT:
+        c_norm = _norm_key(c)
+        c_spaced = _split_camel(c).lower()
+        if (c_norm and c_norm in q_norm) or (c_spaced and c_spaced in ql):
+            hit_col = c
+            break
+
+    if not hit_col:
+        return (None, None, None)
+
+    # try to extract UUID-like value
+    uuid_pat = re.compile(r"\b[0-9a-fA-F]{8}\-[0-9a-fA-F]{4}\-[0-9a-fA-F]{4}\-[0-9a-fA-F]{4}\-[0-9a-fA-F]{12}\b")
+    mu = uuid_pat.search(q)
+    if mu:
+        return (hit_col, mu.group(0), lim)
+
+    # fallback: extract a token after the key phrase (handles numeric keys)
+    # e.g. "orderitemkey 12345"
+    token_pat = re.compile(rf"{re.escape(_split_camel(hit_col).lower())}\s+([A-Za-z0-9\-#]{{2,80}})", re.IGNORECASE)
+    token_pat2 = re.compile(rf"{re.escape(_norm_key(hit_col))}\s*[:=]?\s*([A-Za-z0-9\-#]{{2,80}})", re.IGNORECASE)
+    mt2 = token_pat2.search(_norm_key(q))
+    if mt2:
+        return (hit_col, mt2.group(1).strip(), lim)
+
+    mt = token_pat.search(q)
+    if mt:
+        return (hit_col, mt.group(1).strip(), lim)
+
+    return (hit_col, None, lim)
 
 # -------------------------------------------------
 # Make formulas readable (avoid LaTeX)
@@ -306,6 +405,83 @@ def classify_intent(question: str) -> str:
 
     # everything else: treat as data question
     return "data_question"
+
+# -------------------------------------------------
+# GENERIC COLUMN NAME RESOLUTION (FIXES: package, mainchannel, marketing source, ANY COLUMN)
+# -------------------------------------------------
+def _norm_key(s: str) -> str:
+    return re.sub(r'[^a-z0-9]+', '', (s or '').lower())
+
+def _split_camel(s: str) -> str:
+    if not s:
+        return ""
+    s = s.replace("_", " ").replace("-", " ")
+    s = re.sub(r'([a-z0-9])([A-Z])', r'\1 \2', s)
+    s = re.sub(r'\s+', ' ', s).strip()
+    return s
+
+# Build variants like:
+#   "MarketingSource" -> ["marketing source", "marketingsource"]
+#   "MainChannel"     -> ["main channel", "mainchannel"]
+# and map them back to the real column name in COLS.
+_COL_VARIANTS = {}  # variant(lower) -> real_col
+_COL_VARIANTS_NORM = {}  # normalized variant -> real_col
+for _c in COLS:
+    v1 = (_c or "").strip().lower()
+    v2 = _split_camel(_c).lower()
+    v3 = _norm_key(_c)  # no spaces
+    if v1:
+        _COL_VARIANTS[v1] = _c
+        _COL_VARIANTS_NORM[_norm_key(v1)] = _c
+    if v2:
+        _COL_VARIANTS[v2] = _c
+        _COL_VARIANTS_NORM[_norm_key(v2)] = _c
+    if v3:
+        _COL_VARIANTS_NORM[v3] = _c
+
+# Optional aliases (small set; you can add more later)
+_ALIAS_MAP = {
+    "package": ["package", "package name", "packagename", "pkg", "pkgname", "order package", "product package"],
+    "mainchannel": ["mainchannel", "main channel", "channel"],
+    "marketingsource": ["marketing source", "marketingsource", "marketing", "source"],
+    "providername": ["provider", "provider name", "providername"],
+    "productname": ["product", "product name", "productname"],
+}
+
+def resolve_col_name(user_phrase: str):
+    """
+    Resolve any user-typed column phrase to a real column in COLS.
+    Works for: package, Mainchannel, Marketing source, CompanyState, etc.
+    """
+    if not user_phrase:
+        return None
+    raw = (user_phrase or "").strip().lower()
+    if not raw:
+        return None
+
+    # 1) direct variant match
+    if raw in _COL_VARIANTS:
+        return _COL_VARIANTS[raw]
+
+    # 2) normalized match (removes spaces/punct)
+    nk = _norm_key(raw)
+    if nk in _COL_VARIANTS_NORM:
+        return _COL_VARIANTS_NORM[nk]
+
+    # 3) alias expansion
+    for k, vals in _ALIAS_MAP.items():
+        if nk == _norm_key(k) or raw == k:
+            for v in vals:
+                col = resolve_col_name(v)  # recurse through variants
+                if col:
+                    return col
+
+    # 4) contains match (last resort)
+    for c in COLS:
+        if nk and nk in _norm_key(c):
+            return c
+
+    return None
 
 # -------------------------------------------------
 # PREDICTION HELPERS
@@ -431,6 +607,108 @@ def _wants_estimate_for_metric(q_lower: str, metric_name: str) -> bool:
 def _wants_any_estimates(q_lower: str) -> bool:
     return any(w in q_lower for w in _PRED_WORDS)
 
+def _extract_generic_filters_anycol(question: str):
+    """
+    Extract filters for ANY column (supports multi-word column phrases):
+      - "package is DirecTV" / "package = DirecTV" / "package: DirecTV"
+      - "package DirecTV"
+      - "for the package DirecTV"
+      - "Mainchannel Google"
+      - "Marketing source xyz"
+    IMPORTANT: This does not require the user to type the exact column name.
+    It matches column variants like "MarketingSource" <-> "marketing source".
+    """
+    q = (question or "").strip()
+    ql = q.lower()
+
+    stop_words = set(["for", "the", "in", "on", "where", "with", "month", "year", "and", "or", "to", "of", "by"])
+    stop_words2 = stop_words.union(set(["based", "wise", "monthwise", "yearwise"]))
+
+    def _clean_value(val_raw: str) -> str:
+        parts = (val_raw or "").strip().split()
+        cleaned = []
+        for p in parts:
+            if p.lower() in stop_words2:
+                break
+            cleaned.append(p)
+        val = " ".join(cleaned).strip()
+        val = re.split(r"[,.?;!]", val)[0].strip()
+        return val
+
+    # Build a list of column phrases (variants) and sort longest-first so
+    # "marketing source" matches before "source" etc.
+    variants = sorted(list(_COL_VARIANTS.keys()), key=lambda s: len(s), reverse=True)
+
+    used_spans = []  # avoid double-capturing overlapping ranges
+    out = []
+
+    def _span_overlaps(a, b):
+        for (s, e) in used_spans:
+            if not (b <= s or a >= e):
+                return True
+        return False
+
+    # A) operator form: "<col phrase> is/=/: <value>"
+    for v in variants:
+        if not v or v not in ql:
+            continue
+        # allow extra spaces in the question for multi-word phrases
+        v_re = re.escape(v)
+        pat = re.compile(rf"\b{v_re}\b\s*(?:=|:|\bis\b)\s*([A-Za-z0-9&._\-#/ ]{{2,80}})", flags=re.IGNORECASE)
+        for m in pat.finditer(q):
+            a, b = m.span()
+            if _span_overlaps(a, b):
+                continue
+            col = resolve_col_name(v)
+            if not col:
+                continue
+            val = _clean_value(m.group(1))
+            if not val:
+                continue
+            out.append((col, val))
+            used_spans.append((a, b))
+
+    # B) no-operator form: "for the <col phrase> <value>" OR "<col phrase> <value>"
+    # We only do this for variants that are at least 3 chars to reduce false hits.
+    for v in variants:
+        if not v or len(v) < 3 or v not in ql:
+            continue
+        v_re = re.escape(v)
+        pat = re.compile(rf"\b(?:for\s+the\s+|for\s+)?{v_re}\b\s+([A-Za-z0-9&._\-#/ ]{{2,80}})", flags=re.IGNORECASE)
+        for m in pat.finditer(q):
+            a, b = m.span()
+            if _span_overlaps(a, b):
+                continue
+            col = resolve_col_name(v)
+            if not col:
+                continue
+            val = _clean_value(m.group(1))
+            if not val:
+                continue
+            out.append((col, val))
+            used_spans.append((a, b))
+
+    # C) reversed form: "DirecTV package" (keep ONLY for package-ish columns because value-first is risky)
+    pkg_col = resolve_col_name("package")
+    if pkg_col:
+        pat = re.compile(r"\b([A-Za-z0-9&._\-#/]{2,80})\s+package\b", flags=re.IGNORECASE)
+        for m in pat.finditer(q):
+            a, b = m.span()
+            if _span_overlaps(a, b):
+                continue
+            val = _clean_value(m.group(1))
+            if not val:
+                continue
+            out.append((pkg_col, val))
+            used_spans.append((a, b))
+
+    # dedupe while preserving order
+    try:
+        out = list(dict.fromkeys(out))
+    except Exception:
+        pass
+    return out
+
 def build_prediction_monthly_sql(question: str):
     """
     Stable month-wise SQL for prediction mode.
@@ -447,38 +725,10 @@ def build_prediction_monthly_sql(question: str):
     provider = extract_provider(question)
     product = extract_product(question)
 
-    # generic filters: "<colname> is/=/: <value>"
-    q = (question or "").strip()
-
+    # NEW: generic filters for ANY column names (including multi-word column phrases)
     generic_filters = []
     try:
-        pattern = re.compile(
-            r"\b([A-Za-z_][A-Za-z0-9_]{1,50})\b\s*(?:=|:|\bis\b)\s*([A-Za-z0-9&._\-#/ ]{2,60})",
-            flags=re.IGNORECASE
-        )
-
-        stop_words = set(["for", "in", "on", "where", "with", "month", "year", "and", "or"])
-
-        for m in pattern.finditer(q):
-            col_raw = (m.group(1) or "").strip()
-            val_raw = (m.group(2) or "").strip()
-
-            col = next((c for c in COLS if c.lower() == col_raw.lower()), None)
-            if not col:
-                continue
-
-            parts = val_raw.split()
-            cleaned = []
-            for p in parts:
-                if p.lower() in stop_words:
-                    break
-                cleaned.append(p)
-            val = " ".join(cleaned).strip()
-
-            if not val:
-                continue
-
-            generic_filters.append((col, val))
+        generic_filters = _extract_generic_filters_anycol(question)
     except Exception:
         generic_filters = []
 
@@ -512,7 +762,10 @@ def build_prediction_monthly_sql(question: str):
         )
 
     for col, val in generic_filters:
-        if col.lower() in ("providername", "productname"):
+        # don't double-apply provider/product if user typed them as generic filters too
+        if col and col.lower() in ("providername", "productname"):
+            continue
+        if not col or col not in COLS:
             continue
         where.append(
             f"LOWER(TRIM(CAST({qident(col)} AS VARCHAR))) LIKE '%' || LOWER(TRIM({_safe_sql_literal(val)})) || '%'"
@@ -1013,7 +1266,7 @@ def handle_general_data_question(question: str, history=None):
                     seen.add(c)
 
             df_out = df_out[final_cols] if final_cols else df_out
-
+            df_out = apply_hidden_cols_policy(df_out, question)
             table_html = rows_to_html_table(df_out.to_dict(orient="records")) if not df_out.empty else "<p><i>No data</i></p>"
             reply_text = build_prediction_reply(df_out, cols_to_estimate, window=window)
 
@@ -1025,6 +1278,15 @@ def handle_general_data_question(question: str, history=None):
                 "truncated": False,
                 "download_url": None,
             }
+
+            # IMPORTANT: return actual SQL used in prediction mode (so you don't get fake LLM SQL)
+            if DEBUG_SQL:
+                result["debug_sql"] = pred_sql
+                try:
+                    result["applied_filters"] = _extract_generic_filters_anycol(question)
+                except Exception:
+                    result["applied_filters"] = []
+
             return result
 
         except Exception as e:
@@ -1074,12 +1336,43 @@ def handle_general_data_question(question: str, history=None):
             "plot_data_uri": None,
         }
     # --- END ambiguous time block ---
-
     try:
         with _get_duck_con() as local_con:
             sample_rows = local_con.execute(f"SELECT * FROM {TABLE} LIMIT 50").fetchdf()
     except Exception:
         sample_rows = SAMPLE_DF if not SAMPLE_DF.empty else pd.DataFrame(columns=COLS)
+
+    # -------------------------------------------------
+    # KEY LOOKUP OVERRIDE (ensures hidden key appears when user asks by key)
+    # -------------------------------------------------
+    key_col, key_val, key_lim = _extract_key_lookup(question)
+    if key_col and key_val:
+        sql_text = f"""
+        SELECT *
+        FROM {TABLE}
+        WHERE LOWER(TRIM(CAST({qident(key_col)} AS VARCHAR))) = LOWER(TRIM({_safe_sql_literal(key_val)}))
+        LIMIT {int(key_lim)}
+        """.strip()
+
+        df = run_sql_and_fetch_df(sql_text)
+
+        total_rows = len(df)
+        df_preview = df.head(MAX_ROWS) if (MAX_ROWS and total_rows > MAX_ROWS) else df
+        df_preview = apply_hidden_cols_policy(df_preview, question)
+
+        table_html = rows_to_html_table(df_preview.to_dict(orient="records")) if not df_preview.empty else "<p><i>No data</i></p>"
+
+        result = {
+            "reply": f"Here are the results for: {question}",
+            "table_html": table_html,
+            "plot_data_uri": None,
+            "rows_returned": total_rows,
+            "truncated": (MAX_ROWS and total_rows > MAX_ROWS),
+            "download_url": None,
+        }
+        if DEBUG_SQL:
+            result["debug_sql"] = sql_text
+        return result
 
     # 1) Ask model for SQL  (conversation-aware)
     sql_text = ask_model_for_sql(augmented_question, schema_cols, sample_rows)
@@ -1144,7 +1437,7 @@ def handle_general_data_question(question: str, history=None):
     if MAX_ROWS and total_rows > MAX_ROWS:
         truncated = True
         df_preview = df.head(MAX_ROWS)
-
+    df_preview = apply_hidden_cols_policy(df_preview, question)
     if not df_preview.empty:
         table_html = rows_to_html_table(df_preview.to_dict(orient="records"))
     else:
@@ -1364,7 +1657,16 @@ def chat():
         })
 
     # Row/column count quick question
-    if re.search(r'\bhow many rows\b|\brow count\b|\bnumber of rows\b', qlow):
+# Row/column count quick question (ONLY when no filters are present)
+    is_rowcount_phrase = re.search(r'\bhow many rows\b|\brow count\b|\bnumber of rows\b', qlow)
+
+    # If the user includes filters, do NOT short-circuit; let SQL handler run
+    has_filter_words = re.search(
+        r'\bwhere\b|\bwith\b|\bfor\b|\bprovider\b|\bproduct\b|\bltype\b|\b=\b',
+        qlow
+    )
+
+    if is_rowcount_phrase and not has_filter_words:
         try:
             rows = ROWCOUNT
             if rows is None:
@@ -1758,4 +2060,3 @@ if __name__ == "__main__":
         print("Route print failed:", e)
 
     app.run(host="0.0.0.0", port=PORT)
-
