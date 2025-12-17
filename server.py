@@ -82,6 +82,7 @@ SAMPLE_MESSAGES = [
     {"role": "user", "text": "give top 10 product name, their profit , profit rate based on profit rate for 2024", "time": SAMPLE_CHAT_CREATED_AT + 8},
     {"role": "user", "text": "show me the cancellation count for provider spectrum where status = cancelled for august 2025", "time": SAMPLE_CHAT_CREATED_AT + 9},
     {"role": "user", "text": "show me the distinct status values", "time": SAMPLE_CHAT_CREATED_AT + 10},
+    {"role": "user", "text": "show me the top 5 company names based on their profit on 2025 in a pie chart", "time": SAMPLE_CHAT_CREATED_AT + 11}
 ]
 
 SAMPLE_CHAT = {
@@ -263,8 +264,16 @@ HIDDEN_COLS_DEFAULT = {
     "OrderItemKey",
 }
 
-def _normalize_colname(s: str) -> str:
-    return (s or "").strip().lower()
+def _norm_key(s: str) -> str:
+    return re.sub(r'[^a-z0-9]+', '', (s or '').lower())
+
+def _split_camel(s: str) -> str:
+    if not s:
+        return ""
+    s = s.replace("_", " ").replace("-", " ")
+    s = re.sub(r'([a-z0-9])([A-Z])', r'\1 \2', s)
+    s = re.sub(r'\s+', ' ', s).strip()
+    return s
 
 def _hidden_cols_user_requested(question: str):
     """
@@ -409,16 +418,7 @@ def classify_intent(question: str) -> str:
 # -------------------------------------------------
 # GENERIC COLUMN NAME RESOLUTION (FIXES: package, mainchannel, marketing source, ANY COLUMN)
 # -------------------------------------------------
-def _norm_key(s: str) -> str:
-    return re.sub(r'[^a-z0-9]+', '', (s or '').lower())
 
-def _split_camel(s: str) -> str:
-    if not s:
-        return ""
-    s = s.replace("_", " ").replace("-", " ")
-    s = re.sub(r'([a-z0-9])([A-Z])', r'\1 \2', s)
-    s = re.sub(r'\s+', ' ', s).strip()
-    return s
 
 # Build variants like:
 #   "MarketingSource" -> ["marketing source", "marketingsource"]
@@ -932,6 +932,10 @@ Your job:
 1. Decide if the user's question is about this table's data.
 2. If YES → return exactly ONE DuckDB SELECT statement that answers it.
 3. If NO → return exactly NO_SQL.
+IMPORTANT:
+- Questions asking for charts, graphs, plots, pie charts, histograms, distributions,
+  rankings, top/bottom N, or comparisons are ALWAYS data questions.
+- NEVER return NO_SQL for such questions.
 
 DO NOT return explanations, markdown, or comments.
 Return ONLY:
@@ -969,15 +973,29 @@ Technical rules:
   LOWER(TRIM(CAST(col AS VARCHAR))) = LOWER(TRIM('value'))
 - When returning names or values for a column, prefer to exclude NULL or empty strings:
   WHERE col IS NOT NULL AND TRIM(COALESCE(CAST(col AS VARCHAR),'')) <> ''
-- When the user asks for results "based on", "by", "where", "sorted by" or "whose <metric> ..."
-  (e.g. "based on profit", "by profit", "estimated commission = 250", "orders > 150"):
-  ALWAYS include both:
-  • the identifying column(s) (e.g. ProviderName, MainChannel, Package), AND
-  • the metric column(s) you are using (Profit, Revenue, EstimatedCommission, COUNT(*) AS orders, etc.)
-  in the SELECT list.
+- When the user asks for:
+  • "top N", "bottom N"
+  • "based on <metric>"
+  • "by <dimension>"
+  • rankings or comparisons
+
+  You MUST:
+  1. GROUP BY the identifying column(s) (e.g. CompanyName, ProviderName)
+  2. Aggregate metrics using SUM / COUNT / AVG as appropriate
+  3. ORDER BY the aggregated metric (DESC for top, ASC for bottom)
+  4. Apply LIMIT N
+
 - IMPORTANT: If the user asks for estimate/prediction/forecast/projected values, return NO_SQL.
 - If the question wants raw row details (not aggregation), include LIMIT {MAX_ROWS}, unless the user explicitly asks for "all ...".
 - If the question is purely conceptual/theory (definitions, explanations) without needing actual table values, return NO_SQL.
+- If the user asks for a chart, graph, plot, distribution, comparison, or "by <something>":
+  return an aggregated result suitable for visualization.
+  Prefer:
+  • 1 numeric column → histogram
+  • 2 numeric columns → scatter plot
+  • 1 category + 1 numeric → pie or bar
+  • 1 category + multiple numeric columns → stacked bar
+  Do NOT return raw row-level data in these cases.
 
 Schema:
 {schema_info}
@@ -1084,12 +1102,17 @@ def answer_theory_question(question: str):
                 {
                     "role": "system",
                     "content": (
-                        "You are a clear, concise assistant.\n"
-                        "IMPORTANT: Do NOT use LaTeX (no \\[ \\], no \\( \\)).\n"
-                        "If you need formulas, write them in plain text, like:\n"
-                        "Profit = Total Revenue - Total Costs\n"
-                        "Profit Rate (%) = (Profit / Total Revenue) * 100\n"
-                    ),
+                        "You are a clear, concise assistant.\n\n"
+                        "IMPORTANT:\n"
+                        "- Do NOT say that you cannot create charts or visualizations.\n"
+                        "- If a question asks for data, charts, graphs, plots, rankings, or comparisons, answer normally using the data.\n\n"
+                        "FORMATTING RULES:\n"
+                        "- Do NOT use LaTeX (no \\[ \\], no \\( \\)).\n"
+                        "- If you need formulas, write them in plain text, for example:\n"
+                        "  Profit = Total Revenue - Total Costs\n"
+                        "  Profit Rate (%) = (Profit / Total Revenue) * 100\n"
+                    )
+
                 },
                 {"role": "user", "content": question},
             ],
@@ -1443,28 +1466,127 @@ def handle_general_data_question(question: str, history=None):
     else:
         table_html = "<p><i>No data</i></p>"
 
-    # 5) Optional plot
+    # 5) Optional plot (AUTO + USER-FORCED)
     plot_uri = None
+
+    def _detect_forced_chart(q: str):
+        q = (q or "").lower()
+        if "stacked" in q:
+            return "stacked_bar"
+        if "pie" in q:
+            return "pie"
+        if "scatter" in q:
+            return "scatter"
+        if "hist" in q or "histogram" in q:
+            return "hist"
+        if "line" in q:
+            return "line"
+        if "bar" in q:
+            return "bar"
+        return None
+
     try:
         if not df.empty:
-            if "month" in df.columns:
-                nums = [c for c in df.columns if c != "month" and pd.api.types.is_numeric_dtype(df[c])]
-                if nums:
-                    ycol = nums[0]
+            forced = _detect_forced_chart(question)
+            kind = forced
+
+            num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+            cat_cols = [c for c in df.columns if c not in num_cols]
+
+            # -------------------------
+            # USER-FORCED CHART
+            # -------------------------
+            if kind == "hist" and num_cols:
+                plot_uri = plot_to_base64([], df[num_cols[0]].tolist(), kind="hist", title=question)
+
+            elif kind == "scatter" and len(num_cols) >= 2:
+                plot_uri = plot_to_base64(
+                    df[num_cols[0]].tolist(),
+                    df[num_cols[1]].tolist(),
+                    kind="scatter",
+                    title=question,
+                )
+
+            elif kind == "stacked_bar" and cat_cols and len(num_cols) >= 2:
+                labels = df[cat_cols[0]].astype(str).tolist()
+                series = [df[c].fillna(0).tolist() for c in num_cols]
+                plot_uri = plot_to_base64(labels, series, kind="stacked_bar", title=question)
+
+            elif kind == "pie" and cat_cols and num_cols:
+                labels = df[cat_cols[0]].astype(str).tolist()
+                vals = df[num_cols[0]].fillna(0).tolist()
+                plot_uri = plot_to_base64(labels, vals, kind="pie", title=question)
+
+            elif kind == "line" and cat_cols and num_cols:
+                plot_uri = plot_to_base64(
+                    df[cat_cols[0]].astype(str).tolist(),
+                    df[num_cols[0]].fillna(0).tolist(),
+                    kind="line",
+                    title=question,
+                )
+
+            elif kind == "bar" and cat_cols and num_cols:
+                plot_uri = plot_to_base64(
+                    df[cat_cols[0]].astype(str).tolist(),
+                    df[num_cols[0]].fillna(0).tolist(),
+                    kind="bar",
+                    title=question,
+                )
+
+            # -------------------------
+            # AUTO CHART (if no force)
+            # -------------------------
+            if plot_uri is None:
+                # 1 numeric → histogram
+                if len(num_cols) == 1:
+                    plot_uri = plot_to_base64([], df[num_cols[0]].tolist(), kind="hist", title=question)
+
+                # 2 numeric → scatter
+                elif len(num_cols) == 2 and not cat_cols:
+                    plot_uri = plot_to_base64(
+                        df[num_cols[0]].tolist(),
+                        df[num_cols[1]].tolist(),
+                        kind="scatter",
+                        title=question,
+                    )
+
+                # category + 2+ numeric → stacked bar
+                elif cat_cols and len(num_cols) >= 2:
+                    labels = df[cat_cols[0]].astype(str).tolist()
+                    series = [df[c].fillna(0).tolist() for c in num_cols]
+                    plot_uri = plot_to_base64(labels, series, kind="stacked_bar", title=question)
+
+                # category + 1 numeric (small) → pie
+                elif cat_cols and len(num_cols) == 1 and len(df) <= 12:
+                    plot_uri = plot_to_base64(
+                        df[cat_cols[0]].astype(str).tolist(),
+                        df[num_cols[0]].fillna(0).tolist(),
+                        kind="pie",
+                        title=question,
+                    )
+
+                # month/time → line
+                elif "month" in df.columns and num_cols:
                     plot_uri = plot_to_base64(
                         df["month"].astype(str).tolist(),
-                        df[ycol].fillna(0).tolist(),
+                        df[num_cols[0]].fillna(0).tolist(),
                         kind="line",
                         title=question,
                     )
-            else:
-                if df.shape[1] >= 2 and pd.api.types.is_numeric_dtype(df.iloc[:, 1]):
-                    labels = df.iloc[:, 0].astype(str).tolist()
-                    vals = df.iloc[:, 1].astype(float).fillna(0).tolist()
-                    plot_uri = plot_to_base64(labels, vals, kind="bar", title=question)
+
+                # fallback → bar
+                elif cat_cols and num_cols:
+                    plot_uri = plot_to_base64(
+                        df[cat_cols[0]].astype(str).tolist(),
+                        df[num_cols[0]].fillna(0).tolist(),
+                        kind="bar",
+                        title=question,
+                    )
+
     except Exception as e:
         print("Plot error:", e, traceback.format_exc())
         plot_uri = None
+
 
     # 5.a) Prepare Excel export ONLY as in-memory cache; no file written to disk
     download_url = None
@@ -1662,9 +1784,10 @@ def chat():
 
     # If the user includes filters, do NOT short-circuit; let SQL handler run
     has_filter_words = re.search(
-        r'\bwhere\b|\bwith\b|\bfor\b|\bprovider\b|\bproduct\b|\bltype\b|\b=\b',
-        qlow
+    r'\bwhere\b|\bwith\b|\bfor\b|\bprovider\b|\bproduct\b|\bltype\b|=',
+    qlow
     )
+
 
     if is_rowcount_phrase and not has_filter_words:
         try:
