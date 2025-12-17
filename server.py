@@ -24,7 +24,7 @@ from sklearn.linear_model import LinearRegression
 # -------------------------------------------------
 load_dotenv()
 
-DEBUG_SQL = os.getenv("DEBUG_SQL", "false").lower() in ("1", "true", "yes")
+DEBUG_SQL = True
 
 TZ = ZoneInfo("Asia/Kolkata")  # user timezone
 
@@ -255,6 +255,206 @@ def is_safe_select(sql: str) -> bool:
         if re.search(rf"\b{w}\b", sql_clean, flags=re.IGNORECASE):
             return False
     return True
+def _wants_addon(question: str) -> bool:
+    q = (question or "").lower()
+    return ("addon" in q) or ("add-on" in q) or ("add on" in q)
+
+def _extract_addon_value(question: str):
+    """
+    Detect explicit addon value in the user's question.
+    Returns (addon_value:int|None, is_explicit:bool)
+
+    Matches:
+      addon = 1, addon=1, addon is 1, addon:1, addon 1
+      addon = 0, addon=0, addon is 0, addon:0, addon 0
+    """
+    q = (question or "").lower()
+
+    # explicit numeric addon filter (0/1)
+    m = re.search(r"\badd\s*-\s*on\b\s*(?:=|:|\bis\b)?\s*(0|1)\b", q)
+    if m:
+        return (int(m.group(1)), True)
+
+    m = re.search(r"\badd\s+on\b\s*(?:=|:|\bis\b)?\s*(0|1)\b", q)
+    if m:
+        return (int(m.group(1)), True)
+
+    m = re.search(r"\baddon\b\s*(?:=|:|\bis\b)?\s*(0|1)\b", q)
+    if m:
+        return (int(m.group(1)), True)
+
+    return (None, False)
+
+def addon_filter_sql(question: str) -> str:
+    """
+    Addon rules:
+    - If user explicitly says addon=1 => filter Addon = 1 (no forced Ltype)
+    - If user explicitly says addon=0 => filter Addon = 0 (and default Ltype applies unless user asked Ltype)
+    - If user only says "addon" with no value => DO NOT filter Addon column (it is a mode -> Ltype='A')
+    """
+    addon_val, is_explicit = _extract_addon_value(question)
+    if not is_explicit:
+        return ""
+
+    # Use TRY_CAST for safety if Addon is stored as text
+    return f"(TRY_CAST(Addon AS INTEGER) = {int(addon_val)})"
+
+def ltype_filter_sql(question: str) -> str:
+    """
+    ✅ Final rules (as requested):
+
+    Default (normal questions, no addon mentioned at all)
+      -> Ltype = 'L' OR Ltype IS NULL
+
+    If user says “addon” (but does NOT say addon=0 or addon=1)
+      -> treat as a mode => Ltype = 'A'
+
+    If user says addon = 1
+      -> do NOT force any Ltype (unless user explicitly asks Ltype)
+      -> Ltype can be L / A / NULL (anything)
+
+    If user says addon = 0
+      -> filter Addon = 0
+      -> and behave like default for Ltype again (L or NULL), unless user explicitly asked Ltype
+    """
+    q = (question or "").lower()
+
+    addon_val, is_explicit = _extract_addon_value(question)
+
+    # If addon is explicitly specified:
+    # - addon=1 => no forced Ltype
+    # - addon=0 => default Ltype (L or NULL)
+    if is_explicit:
+        if addon_val == 1:
+            return ""  # do not force any Ltype
+        else:
+            return "(TRIM(CAST(Ltype AS VARCHAR)) = 'L' OR Ltype IS NULL)"
+
+    # If addon keyword is present without explicit value => Ltype must be A
+    if _wants_addon(question):
+        return "(TRIM(CAST(Ltype AS VARCHAR)) = 'A')"
+
+    # Default => L + NULL
+    return "(TRIM(CAST(Ltype AS VARCHAR)) = 'L' OR Ltype IS NULL)"
+
+def policy_filter_sql(question: str, *, already_has_ltype: bool = False, already_has_addon: bool = False) -> str:
+    """
+    Build the combined filter to apply at query-time.
+
+    Important behavior:
+    - If user explicitly wrote Ltype in the question, we DO NOT override it (handled by caller via already_has_ltype flag).
+      (In apply_ltype_policy_to_sql we treat SQL containing 'ltype' as already_has_ltype)
+    - If SQL already contains addon filter, we do not inject another addon filter.
+    """
+    parts = []
+
+    # Addon filter (only when addon=0/1 explicitly mentioned)
+    addon_f = "" if already_has_addon else addon_filter_sql(question)
+    if addon_f:
+        parts.append(addon_f)
+
+    # Ltype filter (default / addon-mode), but skip if SQL already has Ltype
+    ltype_f = "" if already_has_ltype else ltype_filter_sql(question)
+    if ltype_f:
+        parts.append(ltype_f)
+
+    if not parts:
+        return ""
+
+    if len(parts) == 1:
+        return parts[0]
+    return "(" + " AND ".join(parts) + ")"
+
+def apply_ltype_policy_to_sql(sql: str, question: str) -> str:
+    """
+    Inject Ltype/AddOn policy filter into the TOP-LEVEL query for {TABLE}.
+    Inserts into WHERE if present, else adds WHERE before GROUP BY/HAVING/ORDER BY/LIMIT.
+
+    Robust to newlines/tabs because it uses regex word-boundary clause detection.
+
+    Also fixes invalid HAVING usage:
+      1) HAVING without GROUP BY -> convert first HAVING to WHERE
+      2) HAVING appears before GROUP BY -> convert first HAVING to WHERE
+    """
+    if not sql or not isinstance(sql, str):
+        return sql
+
+    s = sql.strip().rstrip(";")
+    s_low = s.lower()
+
+    # If query doesn't reference the main table, don't touch it
+    if TABLE.lower() not in s_low:
+        return sql
+
+    # If SQL already mentions these columns, don't override those parts
+    already_has_ltype = re.search(r"\b(where|having)\b[\s\S]*\bltype\b", s_low, re.IGNORECASE) is not None
+    already_has_addon = re.search(r"\baddon\b", s_low, flags=re.IGNORECASE) is not None
+
+    filt = policy_filter_sql(
+        question,
+        already_has_ltype=already_has_ltype,
+        already_has_addon=already_has_addon
+    )
+    if not filt:
+        return sql
+
+    # ---------- helpers ----------
+    def _find_clause_span(text: str, clause: str):
+        """
+        Return (start, end) span of the FIRST occurrence of clause keyword as a whole word,
+        or None if not found.
+        """
+        m = re.search(rf"\b{re.escape(clause)}\b", text, flags=re.IGNORECASE)
+        return m.span() if m else None
+
+    def _replace_first_keyword(text: str, keyword: str, replacement: str):
+        return re.sub(rf"\b{re.escape(keyword)}\b", replacement, text, count=1, flags=re.IGNORECASE)
+
+    # ---------- FIX HAVING problems BEFORE injecting ----------
+    span_having = _find_clause_span(s, "HAVING")
+    span_group  = _find_clause_span(s, "GROUP")
+    # Note: we specifically care about "GROUP BY", but "GROUP" is good enough for ordering checks
+    # because GROUP BY always starts with GROUP.
+
+    if span_having:
+        has_group_by = re.search(r"\bGROUP\s+BY\b", s, flags=re.IGNORECASE) is not None
+
+        # 1) HAVING without GROUP BY -> invalid
+        if not has_group_by:
+            s = _replace_first_keyword(s, "HAVING", "WHERE")
+        else:
+            # 2) HAVING before GROUP BY -> invalid ordering
+            span_having2 = _find_clause_span(s, "HAVING")
+            span_group2  = _find_clause_span(s, "GROUP")
+            if span_having2 and span_group2 and span_having2[0] < span_group2[0]:
+                s = _replace_first_keyword(s, "HAVING", "WHERE")
+
+    # refresh lowered string after potential edits
+    s_low = s.lower()
+
+    # ---------- Inject filter into WHERE or create WHERE ----------
+    span_where = _find_clause_span(s, "WHERE")
+    if span_where:
+        # insert right after WHERE keyword
+        insert_at = span_where[1]  # position just after WHERE
+        head = s[:insert_at]
+        tail = s[insert_at:]
+        # WHERE <filt> AND (<existing conditions...>)
+        return f"{head} {filt} AND ({tail.strip()})"
+
+    # No WHERE: insert before the earliest of GROUP BY / HAVING / ORDER BY / LIMIT (if any)
+    cut_spans = []
+    for kw in ["GROUP", "HAVING", "ORDER", "LIMIT"]:
+        sp = _find_clause_span(s, kw)
+        if sp:
+            cut_spans.append(sp[0])
+
+    if cut_spans:
+        cut = min(cut_spans)
+        return f"{s[:cut].rstrip()} WHERE {filt} {s[cut:].lstrip()}"
+    else:
+        return f"{s} WHERE {filt}"
+
 # Columns to hide by default in table output + excel download
 HIDDEN_COLS_DEFAULT = {
     "CompanyKey",
@@ -384,6 +584,9 @@ def strip_latex_math(text: str) -> str:
     t = t.replace("\\%", "%").replace("\\_", "_")
     t = re.sub(r"\n{3,}", "\n\n", t).strip()
     return t
+def user_wants_summary(question: str) -> bool:
+    q = (question or "").lower()
+    return any(k in q for k in ["summarize", "summary", "explain the result", "explain results"])
 
 def classify_intent(question: str) -> str:
     q = (question or "").strip().lower()
@@ -546,6 +749,18 @@ _ENTITY_STOPWORDS = (
     "profit|revenue|rate|orders|order|installation|install|disconnection|disconnect|"
     "estimate|estimated|forecast|predict|predicted|projection|projected"
 )
+# Words/phrases that describe metrics, NOT column filters
+_METRIC_PHRASES = (
+    "profit rate",
+    "installation rate",
+    "disconnection rate",
+    "disconnect rate",
+    "installed rate",
+    "install rate",
+    # generic "rate" causes most false-positives (profit rate -> Profit + 'rate')
+    "rate",
+)
+
 
 def extract_provider(question: str):
     q = (question or "").strip()
@@ -620,7 +835,6 @@ def _extract_generic_filters_anycol(question: str):
     """
     q = (question or "").strip()
     ql = q.lower()
-
     stop_words = set(["for", "the", "in", "on", "where", "with", "month", "year", "and", "or", "to", "of", "by"])
     stop_words2 = stop_words.union(set(["based", "wise", "monthwise", "yearwise"]))
 
@@ -665,6 +879,9 @@ def _extract_generic_filters_anycol(question: str):
             val = _clean_value(m.group(1))
             if not val:
                 continue
+            val_l = (" " + val.lower().strip() + " ")
+            if any(f" {mp} " in val_l for mp in _METRIC_PHRASES):
+                continue
             out.append((col, val))
             used_spans.append((a, b))
 
@@ -684,6 +901,9 @@ def _extract_generic_filters_anycol(question: str):
                 continue
             val = _clean_value(m.group(1))
             if not val:
+                continue
+            val_l = (" " + val.lower().strip() + " ")
+            if any(f" {mp} " in val_l for mp in _METRIC_PHRASES):
                 continue
             out.append((col, val))
             used_spans.append((a, b))
@@ -708,7 +928,6 @@ def _extract_generic_filters_anycol(question: str):
     except Exception:
         pass
     return out
-
 def build_prediction_monthly_sql(question: str):
     """
     Stable month-wise SQL for prediction mode.
@@ -750,6 +969,12 @@ def build_prediction_monthly_sql(question: str):
     where = []
     where.append(f"CAST(SaleDate AS DATE) >= DATE '{date_start.isoformat()}'")
     where.append(f"CAST(SaleDate AS DATE) <  DATE '{date_end.isoformat()}'")
+
+    # ✅ Correct: In prediction mode we are building SQL ourselves, so we are NOT "already having"
+    # addon/ltype in SQL. Let policy_filter_sql apply the rules from the question.
+    pol = policy_filter_sql(question, already_has_ltype=False, already_has_addon=False)
+    if pol:
+        where.append(pol)
 
     if provider:
         where.append(
@@ -809,6 +1034,7 @@ ORDER BY 1
 """.strip()
 
     return sql, target_filter
+
 
 def _month_to_index(ym: str) -> int:
     try:
@@ -984,6 +1210,19 @@ Technical rules:
   2. Aggregate metrics using SUM / COUNT / AVG as appropriate
   3. ORDER BY the aggregated metric (DESC for top, ASC for bottom)
   4. Apply LIMIT N
+
+- IMPORTANT Addon/Ltype policy:
+  1) Default (no addon mentioned at all):
+     ALWAYS filter rows where (Ltype = 'L' OR Ltype IS NULL).
+  2) If user mentions "addon" (addon/add-on/add on) WITHOUT specifying a value:
+     treat it as addon-mode and filter rows where Ltype = 'A'.
+  3) If user explicitly says addon = 1:
+     filter rows where Addon = 1
+     and DO NOT force any Ltype (unless the user explicitly asks Ltype).
+  4) If user explicitly says addon = 0:
+     filter rows where Addon = 0
+     and behave like default for Ltype again (Ltype='L' OR NULL), unless the user explicitly asks Ltype.
+  5) If user explicitly asks Ltype (e.g. Ltype = 'A') then respect that and do not override it.
 
 - IMPORTANT: If the user asks for estimate/prediction/forecast/projected values, return NO_SQL.
 - If the question wants raw row details (not aggregation), include LIMIT {MAX_ROWS}, unless the user explicitly asks for "all ...".
@@ -1361,7 +1600,7 @@ def handle_general_data_question(question: str, history=None):
     # --- END ambiguous time block ---
     try:
         with _get_duck_con() as local_con:
-            sample_rows = local_con.execute(f"SELECT * FROM {TABLE} LIMIT 50").fetchdf()
+            sample_rows = local_con.execute(f"SELECT * FROM {TABLE} LIMIT 10").fetchdf()
     except Exception:
         sample_rows = SAMPLE_DF if not SAMPLE_DF.empty else pd.DataFrame(columns=COLS)
 
@@ -1370,10 +1609,20 @@ def handle_general_data_question(question: str, history=None):
     # -------------------------------------------------
     key_col, key_val, key_lim = _extract_key_lookup(question)
     if key_col and key_val:
+        # For key lookup, also respect explicit Ltype/addon constraints by applying policy_filter_sql
+        # If user explicitly wrote Ltype in the question, we do not override it (so skip Ltype injection here)
+        ql2 = (question or "").lower()
+        key_policy = policy_filter_sql(
+            question,
+            already_has_ltype=("ltype" in ql2),
+            already_has_addon=("addon" in ql2),
+        )
+        key_policy_sql = f"WHERE {key_policy}\n          AND " if key_policy else "WHERE "
+
         sql_text = f"""
         SELECT *
         FROM {TABLE}
-        WHERE LOWER(TRIM(CAST({qident(key_col)} AS VARCHAR))) = LOWER(TRIM({_safe_sql_literal(key_val)}))
+        {key_policy_sql}LOWER(TRIM(CAST({qident(key_col)} AS VARCHAR))) = LOWER(TRIM({_safe_sql_literal(key_val)}))
         LIMIT {int(key_lim)}
         """.strip()
 
@@ -1399,6 +1648,7 @@ def handle_general_data_question(question: str, history=None):
 
     # 1) Ask model for SQL  (conversation-aware)
     sql_text = ask_model_for_sql(augmented_question, schema_cols, sample_rows)
+    sql_text = apply_ltype_policy_to_sql(sql_text, question)
 
     # 2) If NO_SQL → theory/general mode (conversation-aware)
     if not sql_text or sql_text.strip().upper() == "NO_SQL":
@@ -1430,6 +1680,7 @@ def handle_general_data_question(question: str, history=None):
                 fixed = ask_model_fix_sql(sql_text, last_error, schema_cols, sample_rows)
                 if fixed and fixed.strip().upper() != "NO_SQL":
                     sql_text = fixed.strip()
+                    sql_text = apply_ltype_policy_to_sql(sql_text, question)
                     try_count += 1
                     continue
             _log_and_mask_error(last_error, "sql_execution")
@@ -1598,36 +1849,41 @@ def handle_general_data_question(question: str, history=None):
         print("Export cache error:", e, traceback.format_exc())
         download_url = None
 
-    # 6) Let LLM summarize results
-    explanation = ""
-    if not df_preview.empty:
-        preview_rows = df_preview.head(50).to_dict(orient="records")
-        try:
-            prompt = (
-                f"User question: {question}\n"
-                f"SQL used:\n{sql_text}\n\n"
-                f"Result preview (first {min(50, len(preview_rows))} rows, JSON):\n"
-                f"{json.dumps(preview_rows, ensure_ascii=False)}\n\n"
-                f"Please provide:\n"
-                f"1. One short headline-style summary line.\n"
-                f"2. One or two sentences explaining the key points in plain language.\n\n"
-                f"IMPORTANT: Do NOT use LaTeX. If you include formulas, write them in plain text."
-            )
-            resp = client.chat.completions.create(
-                model=CHAT_MODEL,
-                messages=[
-                    {"role": "system", "content": "You are a concise data analyst. Avoid LaTeX; use plain text formulas."},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.0,
-                max_tokens=256,
-            )
-            explanation = (resp.choices[0].message.content or "").strip()
-            explanation = strip_latex_math(explanation)
-        except Exception:
-            explanation = f"Here are the results for: {question}"
-    else:
+    # 6) Summarize ONLY if user asked
+    if df_preview.empty:
         explanation = "No data found for that query."
+    else:
+        if user_wants_summary(question):
+            # your existing LLM summarizer block goes here (keep it same)
+            explanation = ""
+            preview_rows = df_preview.head(50).to_dict(orient="records")
+            try:
+                prompt = (
+                    f"User question: {question}\n"
+                    f"SQL used:\n{sql_text}\n\n"
+                    f"Result preview (first {min(50, len(preview_rows))} rows, JSON):\n"
+                    f"{json.dumps(preview_rows, ensure_ascii=False)}\n\n"
+                    f"Please provide:\n"
+                    f"1. One short headline-style summary line.\n"
+                    f"2. One or two sentences explaining the key points in plain language.\n\n"
+                    f"IMPORTANT: Do NOT use LaTeX. If you include formulas, write them in plain text."
+                )
+                resp = client.chat.completions.create(
+                    model=CHAT_MODEL,
+                    messages=[
+                        {"role": "system", "content": "You are a concise data analyst. Avoid LaTeX; use plain text formulas."},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0.0,
+                    max_tokens=256,
+                )
+                explanation = (resp.choices[0].message.content or "").strip()
+                explanation = strip_latex_math(explanation)
+            except Exception:
+                explanation = f"Here are the results for: {question}"
+        else:
+            explanation = f"Here are the results for: {question} (Ask “summarize” if you want insights.)"
+
 
     result = {
         "reply": explanation,
@@ -1648,6 +1904,7 @@ def handle_general_data_question(question: str, history=None):
         pass
 
     return result
+
 
 # FLASK APP
 # -------------------------------------------------
