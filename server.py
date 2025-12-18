@@ -1,3 +1,4 @@
+
 # server.py
 import os
 import re
@@ -12,7 +13,7 @@ import pandas as pd
 import numpy as np
 from zoneinfo import ZoneInfo
 import time
-from utils import rows_to_html_table, plot_to_base64, embed_text  # your existing utils
+from utils import rows_to_html_table, plot_to_base64 # your existing utils
 import uuid
 from pathlib import Path
 import sqlite3
@@ -82,7 +83,6 @@ SAMPLE_MESSAGES = [
     {"role": "user", "text": "give top 10 product name, their profit , profit rate based on profit rate for 2024", "time": SAMPLE_CHAT_CREATED_AT + 8},
     {"role": "user", "text": "show me the cancellation count for provider spectrum where status = cancelled for august 2025", "time": SAMPLE_CHAT_CREATED_AT + 9},
     {"role": "user", "text": "show me the distinct status values", "time": SAMPLE_CHAT_CREATED_AT + 10},
-    {"role": "user", "text": "show me the top 5 company names based on their profit on 2025 in a pie chart", "time": SAMPLE_CHAT_CREATED_AT + 11}
 ]
 
 SAMPLE_CHAT = {
@@ -166,8 +166,7 @@ def find_best(cols, candidates):
 
 # Candidate lists
 REVENUE_CANDS = [
-    'NetAfterChargeback', 'NetAfterCb', 'GrossAfterCb',
-    'Revenue', 'ProviderPaid', 'Amount', 'SaleAmount'
+    'NetAfterChargeback'
 ]
 PROFIT_CANDS = ['Profit', 'NetProfit', 'ProfitAmount', 'Margin']
 DATE_CANDS = ['sale_date_parsed', 'SaleDate', 'Date', 'OrderDate']
@@ -183,6 +182,33 @@ DETECTED = {
 }
 
 print("Auto-detected columns:", DETECTED)
+# ---------------------------
+# DATE COLUMN CANDIDATES (ADD/UPDATE THESE ABOVE WHERE DETECTED IS BUILT)
+# ---------------------------
+SALE_DATE_CANDS = ["SaleDate", "sale_date_parsed", "OrderDate", "Date"]
+INSTALL_DATE_CANDS = ["InstallDate", "install_date_parsed"]
+DISCONNECT_DATE_CANDS = ["DisconnectDate", "disconnect_date_parsed"]
+
+# IMPORTANT: after DETECTED is initially created, extend it like this:
+# (keep your existing DETECTED keys too)
+try:
+    DETECTED.update({
+        "sale_date": find_best(COLS, SALE_DATE_CANDS),
+        "install_date": find_best(COLS, INSTALL_DATE_CANDS),
+        "disconnect_date": find_best(COLS, DISCONNECT_DATE_CANDS),
+    })
+except Exception:
+    pass
+
+
+def get_sale_date_col():
+    return DETECTED.get("sale_date") or find_best(COLS, SALE_DATE_CANDS)
+
+def get_install_date_col():
+    return DETECTED.get("install_date") or find_best(COLS, INSTALL_DATE_CANDS)
+
+def get_disconnect_date_col():
+    return DETECTED.get("disconnect_date") or find_best(COLS, DISCONNECT_DATE_CANDS)
 
 def get_revenue_col():
     r = DETECTED.get('revenue')
@@ -242,218 +268,43 @@ def _log_and_mask_error(e, context=""):
     return "I couldn't complete that query due to an internal error. Try rephrasing or ask a simpler question."
 
 def is_safe_select(sql: str) -> bool:
-    """Check if SQL is a safe SELECT query (no DML/DDL)."""
+    """Allow SELECT or WITH...SELECT only. Block DML/DDL and multi-statement."""
+    if not sql:
+        return False
+
+    # strip comments
     sql_clean = re.sub(r"--.*$", "", sql, flags=re.MULTILINE)
     sql_clean = re.sub(r"/\*.*?\*/", "", sql_clean, flags=re.DOTALL).strip()
     if not sql_clean:
         return False
-    first_word = sql_clean.split()[0].upper()
-    if first_word != "SELECT":
+
+    # block multiple statements (very common injection vector)
+    # allow trailing semicolon, but not multiple ; or ; in the middle
+    parts = [p.strip() for p in sql_clean.split(";") if p.strip()]
+    if len(parts) != 1:
         return False
-    forbidden = ["INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE", "REPLACE"]
+    sql_clean = parts[0]
+
+    # must start with SELECT or WITH
+    first_word = sql_clean.split()[0].upper()
+    if first_word not in ("SELECT", "WITH"):
+        return False
+
+    # must contain a SELECT somewhere (CTE must eventually select)
+    if not re.search(r"\bSELECT\b", sql_clean, flags=re.IGNORECASE):
+        return False
+
+    # block dangerous keywords (word-boundary)
+    forbidden = [
+        "INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE", "REPLACE",
+        "TRUNCATE", "MERGE", "VACUUM", "ATTACH", "DETACH", "COPY", "EXPORT",
+        "CALL", "EXEC", "EXECUTE"
+    ]
     for w in forbidden:
         if re.search(rf"\b{w}\b", sql_clean, flags=re.IGNORECASE):
             return False
+
     return True
-def _wants_addon(question: str) -> bool:
-    q = (question or "").lower()
-    return ("addon" in q) or ("add-on" in q) or ("add on" in q)
-
-def _extract_addon_value(question: str):
-    """
-    Detect explicit addon value in the user's question.
-    Returns (addon_value:int|None, is_explicit:bool)
-
-    Matches:
-      addon = 1, addon=1, addon is 1, addon:1, addon 1
-      addon = 0, addon=0, addon is 0, addon:0, addon 0
-    """
-    q = (question or "").lower()
-
-    # explicit numeric addon filter (0/1)
-    m = re.search(r"\badd\s*-\s*on\b\s*(?:=|:|\bis\b)?\s*(0|1)\b", q)
-    if m:
-        return (int(m.group(1)), True)
-
-    m = re.search(r"\badd\s+on\b\s*(?:=|:|\bis\b)?\s*(0|1)\b", q)
-    if m:
-        return (int(m.group(1)), True)
-
-    m = re.search(r"\baddon\b\s*(?:=|:|\bis\b)?\s*(0|1)\b", q)
-    if m:
-        return (int(m.group(1)), True)
-
-    return (None, False)
-
-def addon_filter_sql(question: str) -> str:
-    """
-    Addon rules:
-    - If user explicitly says addon=1 => filter Addon = 1 (no forced Ltype)
-    - If user explicitly says addon=0 => filter Addon = 0 (and default Ltype applies unless user asked Ltype)
-    - If user only says "addon" with no value => DO NOT filter Addon column (it is a mode -> Ltype='A')
-    """
-    addon_val, is_explicit = _extract_addon_value(question)
-    if not is_explicit:
-        return ""
-
-    # Use TRY_CAST for safety if Addon is stored as text
-    return f"(TRY_CAST(Addon AS INTEGER) = {int(addon_val)})"
-
-def ltype_filter_sql(question: str) -> str:
-    """
-    ✅ Final rules (as requested):
-
-    Default (normal questions, no addon mentioned at all)
-      -> Ltype = 'L' OR Ltype IS NULL
-
-    If user says “addon” (but does NOT say addon=0 or addon=1)
-      -> treat as a mode => Ltype = 'A'
-
-    If user says addon = 1
-      -> do NOT force any Ltype (unless user explicitly asks Ltype)
-      -> Ltype can be L / A / NULL (anything)
-
-    If user says addon = 0
-      -> filter Addon = 0
-      -> and behave like default for Ltype again (L or NULL), unless user explicitly asked Ltype
-    """
-    q = (question or "").lower()
-
-    addon_val, is_explicit = _extract_addon_value(question)
-
-    # If addon is explicitly specified:
-    # - addon=1 => no forced Ltype
-    # - addon=0 => default Ltype (L or NULL)
-    if is_explicit:
-        if addon_val == 1:
-            return ""  # do not force any Ltype
-        else:
-            return "(TRIM(CAST(Ltype AS VARCHAR)) = 'L' OR Ltype IS NULL)"
-
-    # If addon keyword is present without explicit value => Ltype must be A
-    if _wants_addon(question):
-        return "(TRIM(CAST(Ltype AS VARCHAR)) = 'A')"
-
-    # Default => L + NULL
-    return "(TRIM(CAST(Ltype AS VARCHAR)) = 'L' OR Ltype IS NULL)"
-
-def policy_filter_sql(question: str, *, already_has_ltype: bool = False, already_has_addon: bool = False) -> str:
-    """
-    Build the combined filter to apply at query-time.
-
-    Important behavior:
-    - If user explicitly wrote Ltype in the question, we DO NOT override it (handled by caller via already_has_ltype flag).
-      (In apply_ltype_policy_to_sql we treat SQL containing 'ltype' as already_has_ltype)
-    - If SQL already contains addon filter, we do not inject another addon filter.
-    """
-    parts = []
-
-    # Addon filter (only when addon=0/1 explicitly mentioned)
-    addon_f = "" if already_has_addon else addon_filter_sql(question)
-    if addon_f:
-        parts.append(addon_f)
-
-    # Ltype filter (default / addon-mode), but skip if SQL already has Ltype
-    ltype_f = "" if already_has_ltype else ltype_filter_sql(question)
-    if ltype_f:
-        parts.append(ltype_f)
-
-    if not parts:
-        return ""
-
-    if len(parts) == 1:
-        return parts[0]
-    return "(" + " AND ".join(parts) + ")"
-
-def apply_ltype_policy_to_sql(sql: str, question: str) -> str:
-    """
-    Inject Ltype/AddOn policy filter into the TOP-LEVEL query for {TABLE}.
-    Inserts into WHERE if present, else adds WHERE before GROUP BY/HAVING/ORDER BY/LIMIT.
-
-    Robust to newlines/tabs because it uses regex word-boundary clause detection.
-
-    Also fixes invalid HAVING usage:
-      1) HAVING without GROUP BY -> convert first HAVING to WHERE
-      2) HAVING appears before GROUP BY -> convert first HAVING to WHERE
-    """
-    if not sql or not isinstance(sql, str):
-        return sql
-
-    s = sql.strip().rstrip(";")
-    s_low = s.lower()
-
-    # If query doesn't reference the main table, don't touch it
-    if TABLE.lower() not in s_low:
-        return sql
-
-    # If SQL already mentions these columns, don't override those parts
-    already_has_ltype = re.search(r"\b(where|having)\b[\s\S]*\bltype\b", s_low, re.IGNORECASE) is not None
-    already_has_addon = re.search(r"\baddon\b", s_low, flags=re.IGNORECASE) is not None
-
-    filt = policy_filter_sql(
-        question,
-        already_has_ltype=already_has_ltype,
-        already_has_addon=already_has_addon
-    )
-    if not filt:
-        return sql
-
-    # ---------- helpers ----------
-    def _find_clause_span(text: str, clause: str):
-        """
-        Return (start, end) span of the FIRST occurrence of clause keyword as a whole word,
-        or None if not found.
-        """
-        m = re.search(rf"\b{re.escape(clause)}\b", text, flags=re.IGNORECASE)
-        return m.span() if m else None
-
-    def _replace_first_keyword(text: str, keyword: str, replacement: str):
-        return re.sub(rf"\b{re.escape(keyword)}\b", replacement, text, count=1, flags=re.IGNORECASE)
-
-    # ---------- FIX HAVING problems BEFORE injecting ----------
-    span_having = _find_clause_span(s, "HAVING")
-    span_group  = _find_clause_span(s, "GROUP")
-    # Note: we specifically care about "GROUP BY", but "GROUP" is good enough for ordering checks
-    # because GROUP BY always starts with GROUP.
-
-    if span_having:
-        has_group_by = re.search(r"\bGROUP\s+BY\b", s, flags=re.IGNORECASE) is not None
-
-        # 1) HAVING without GROUP BY -> invalid
-        if not has_group_by:
-            s = _replace_first_keyword(s, "HAVING", "WHERE")
-        else:
-            # 2) HAVING before GROUP BY -> invalid ordering
-            span_having2 = _find_clause_span(s, "HAVING")
-            span_group2  = _find_clause_span(s, "GROUP")
-            if span_having2 and span_group2 and span_having2[0] < span_group2[0]:
-                s = _replace_first_keyword(s, "HAVING", "WHERE")
-
-    # refresh lowered string after potential edits
-    s_low = s.lower()
-
-    # ---------- Inject filter into WHERE or create WHERE ----------
-    span_where = _find_clause_span(s, "WHERE")
-    if span_where:
-        # insert right after WHERE keyword
-        insert_at = span_where[1]  # position just after WHERE
-        head = s[:insert_at]
-        tail = s[insert_at:]
-        # WHERE <filt> AND (<existing conditions...>)
-        return f"{head} {filt} AND ({tail.strip()})"
-
-    # No WHERE: insert before the earliest of GROUP BY / HAVING / ORDER BY / LIMIT (if any)
-    cut_spans = []
-    for kw in ["GROUP", "HAVING", "ORDER", "LIMIT"]:
-        sp = _find_clause_span(s, kw)
-        if sp:
-            cut_spans.append(sp[0])
-
-    if cut_spans:
-        cut = min(cut_spans)
-        return f"{s[:cut].rstrip()} WHERE {filt} {s[cut:].lstrip()}"
-    else:
-        return f"{s} WHERE {filt}"
 
 # Columns to hide by default in table output + excel download
 HIDDEN_COLS_DEFAULT = {
@@ -497,6 +348,21 @@ def _hidden_cols_user_requested(question: str):
             continue
 
     return hits
+
+def pick_anchor_date_col(question: str, requested_metrics: set) -> str:
+    # If multiple metrics are requested together, anchor on SaleDate.
+    if len(requested_metrics) >= 2:
+        return get_sale_date_col() or "SaleDate"
+
+    # Single-metric:
+    m = next(iter(requested_metrics)) if requested_metrics else ""
+    if m == "installation_count":
+        return get_install_date_col() or (get_sale_date_col() or "SaleDate")
+    if m == "disconnection_count":
+        return get_disconnect_date_col() or (get_sale_date_col() or "SaleDate")
+
+    # Default:
+    return get_sale_date_col() or "SaleDate"
 
 def apply_hidden_cols_policy(df: pd.DataFrame, question: str) -> pd.DataFrame:
     """
@@ -584,9 +450,6 @@ def strip_latex_math(text: str) -> str:
     t = t.replace("\\%", "%").replace("\\_", "_")
     t = re.sub(r"\n{3,}", "\n\n", t).strip()
     return t
-def user_wants_summary(question: str) -> bool:
-    q = (question or "").lower()
-    return any(k in q for k in ["summarize", "summary", "explain the result", "explain results"])
 
 def classify_intent(question: str) -> str:
     q = (question or "").strip().lower()
@@ -618,15 +481,7 @@ def classify_intent(question: str) -> str:
     # everything else: treat as data question
     return "data_question"
 
-# -------------------------------------------------
-# GENERIC COLUMN NAME RESOLUTION (FIXES: package, mainchannel, marketing source, ANY COLUMN)
-# -------------------------------------------------
 
-
-# Build variants like:
-#   "MarketingSource" -> ["marketing source", "marketingsource"]
-#   "MainChannel"     -> ["main channel", "mainchannel"]
-# and map them back to the real column name in COLS.
 _COL_VARIANTS = {}  # variant(lower) -> real_col
 _COL_VARIANTS_NORM = {}  # normalized variant -> real_col
 for _c in COLS:
@@ -642,11 +497,10 @@ for _c in COLS:
     if v3:
         _COL_VARIANTS_NORM[v3] = _c
 
-# Optional aliases (small set; you can add more later)
 _ALIAS_MAP = {
     "package": ["package", "package name", "packagename", "pkg", "pkgname", "order package", "product package"],
     "mainchannel": ["mainchannel", "main channel", "channel"],
-    "marketingsource": ["marketing source", "marketingsource", "marketing", "source"],
+    "marketingsource": ["marketing source", "marketingsource", "marketting source", "markettingsource", "marketing", "source"],
     "providername": ["provider", "provider name", "providername"],
     "productname": ["product", "product name", "productname"],
 }
@@ -749,18 +603,6 @@ _ENTITY_STOPWORDS = (
     "profit|revenue|rate|orders|order|installation|install|disconnection|disconnect|"
     "estimate|estimated|forecast|predict|predicted|projection|projected"
 )
-# Words/phrases that describe metrics, NOT column filters
-_METRIC_PHRASES = (
-    "profit rate",
-    "installation rate",
-    "disconnection rate",
-    "disconnect rate",
-    "installed rate",
-    "install rate",
-    # generic "rate" causes most false-positives (profit rate -> Profit + 'rate')
-    "rate",
-)
-
 
 def extract_provider(question: str):
     q = (question or "").strip()
@@ -802,25 +644,28 @@ def extract_product(question: str):
 
 def _safe_sql_literal(s: str) -> str:
     return "'" + (s or "").replace("'", "''").strip() + "'"
-
 def _wants_estimate_for_metric(q_lower: str, metric_name: str) -> bool:
     """
-    True ONLY if estimate/forecast word is NEAR the metric
-    (e.g. 'estimated installation rate', 'forecast profit')
+    True ONLY if estimate/forecast word is NEAR the FULL metric phrase.
+
+    IMPORTANT FIX:
+    - Uses strict word boundaries so "profit" does NOT match inside "profit rate"
+      unless the user explicitly says "estimated profit".
     """
+    if not q_lower or not metric_name:
+        return False
+
     est_words = r"(estimate|estimated|forecast|predict|predicted|projection|projected)"
-    m = re.escape(metric_name)
+
+    # strict phrase match
+    m = re.escape(metric_name.strip().lower())
 
     patterns = [
-        # estimated <metric>
-        rf"\b{est_words}\b\s+(?:\w+\s+){{0,2}}{m}\b",
-        # <metric> estimated
-        rf"\b{m}\b\s+(?:\w+\s+){{0,2}}{est_words}\b",
+        rf"\b{est_words}\b\s+(?:\w+\s+){{0,2}}\b{m}\b",  # estimated <metric>
+        rf"\b{m}\b\s+(?:\w+\s+){{0,2}}\b{est_words}\b",  # <metric> estimated
     ]
     return any(re.search(p, q_lower) for p in patterns)
 
-def _wants_any_estimates(q_lower: str) -> bool:
-    return any(w in q_lower for w in _PRED_WORDS)
 
 def _extract_generic_filters_anycol(question: str):
     """
@@ -835,6 +680,7 @@ def _extract_generic_filters_anycol(question: str):
     """
     q = (question or "").strip()
     ql = q.lower()
+
     stop_words = set(["for", "the", "in", "on", "where", "with", "month", "year", "and", "or", "to", "of", "by"])
     stop_words2 = stop_words.union(set(["based", "wise", "monthwise", "yearwise"]))
 
@@ -866,7 +712,6 @@ def _extract_generic_filters_anycol(question: str):
     for v in variants:
         if not v or v not in ql:
             continue
-        # allow extra spaces in the question for multi-word phrases
         v_re = re.escape(v)
         pat = re.compile(rf"\b{v_re}\b\s*(?:=|:|\bis\b)\s*([A-Za-z0-9&._\-#/ ]{{2,80}})", flags=re.IGNORECASE)
         for m in pat.finditer(q):
@@ -879,34 +724,10 @@ def _extract_generic_filters_anycol(question: str):
             val = _clean_value(m.group(1))
             if not val:
                 continue
-            val_l = (" " + val.lower().strip() + " ")
-            if any(f" {mp} " in val_l for mp in _METRIC_PHRASES):
-                continue
             out.append((col, val))
             used_spans.append((a, b))
 
     # B) no-operator form: "for the <col phrase> <value>" OR "<col phrase> <value>"
-    # We only do this for variants that are at least 3 chars to reduce false hits.
-    for v in variants:
-        if not v or len(v) < 3 or v not in ql:
-            continue
-        v_re = re.escape(v)
-        pat = re.compile(rf"\b(?:for\s+the\s+|for\s+)?{v_re}\b\s+([A-Za-z0-9&._\-#/ ]{{2,80}})", flags=re.IGNORECASE)
-        for m in pat.finditer(q):
-            a, b = m.span()
-            if _span_overlaps(a, b):
-                continue
-            col = resolve_col_name(v)
-            if not col:
-                continue
-            val = _clean_value(m.group(1))
-            if not val:
-                continue
-            val_l = (" " + val.lower().strip() + " ")
-            if any(f" {mp} " in val_l for mp in _METRIC_PHRASES):
-                continue
-            out.append((col, val))
-            used_spans.append((a, b))
 
     # C) reversed form: "DirecTV package" (keep ONLY for package-ish columns because value-first is risky)
     pkg_col = resolve_col_name("package")
@@ -921,6 +742,10 @@ def _extract_generic_filters_anycol(question: str):
                 continue
             out.append((pkg_col, val))
             used_spans.append((a, b))
+    # ---- BLOCK BAD MATCHES LIKE: "profit rate" -> (Profit, rate) ----
+    bad_vals = {"rate", "rates"}
+    out = [(c, v) for (c, v) in out if _norm_key(v) not in bad_vals]
+    # ---------------------------------------------------------------
 
     # dedupe while preserving order
     try:
@@ -928,113 +753,169 @@ def _extract_generic_filters_anycol(question: str):
     except Exception:
         pass
     return out
+
 def build_prediction_monthly_sql(question: str):
-    """
-    Stable month-wise SQL for prediction mode.
-    Uses your real columns:
-      - SaleDate for month
-      - ConfirmedOrder, InstalledOrder, DisconnectDate
-      - NetAfterChargeback (revenue), Profit
-    Also supports generic filters like:
-      package xyz, mainchannel digital, marketing source google, companystate ca, etc.
-    """
     year = extract_year(question)
-    month_year = extract_month_year(question)  # (y,m) or None
+    month_year = extract_month_year(question)
+
+    profit_col = get_profit_col() or "Profit"
+    revenue_col = get_revenue_col() or "NetAfterChargeback"
+
+    sale_date_col = get_sale_date_col() or (get_date_col() or "SaleDate")
+    install_date_col = get_install_date_col() or "InstallDate"
+    disconnect_date_col = get_disconnect_date_col() or "DisconnectDate"
+
+    provider_col = resolve_col_name("providername") or "ProviderName"
+    product_col  = resolve_col_name("productname")  or "ProductName"
 
     provider = extract_provider(question)
     product = extract_product(question)
 
-    # NEW: generic filters for ANY column names (including multi-word column phrases)
     generic_filters = []
     try:
         generic_filters = _extract_generic_filters_anycol(question)
     except Exception:
         generic_filters = []
 
-    # date range
+    # target range + train range
     if month_year:
         y, m = month_year
-        start_m, end_m = _month_start_end(y, m)
-        train_start = start_m - dtmod.timedelta(days=365)
+        target_start, target_end = _month_start_end(y, m)
+        train_start = target_start - dtmod.timedelta(days=365)
         date_start = train_start
-        date_end = end_m
+        date_end = target_end
         target_filter = ("month", y, m)
     else:
         if not year:
             year = dtmod.date.today().year
-        date_start = dtmod.date(year - 1, 1, 1)
-        date_end = dtmod.date(year + 1, 1, 1)
+        target_start = dtmod.date(year, 1, 1)
+        target_end   = dtmod.date(year + 1, 1, 1)
+        train_start  = dtmod.date(year - 1, 1, 1)
+        date_start   = train_start
+        date_end     = dtmod.date(year + 1, 1, 1)
         target_filter = ("year", year)
 
-    where = []
-    where.append(f"CAST(SaleDate AS DATE) >= DATE '{date_start.isoformat()}'")
-    where.append(f"CAST(SaleDate AS DATE) <  DATE '{date_end.isoformat()}'")
-
-    # ✅ Correct: In prediction mode we are building SQL ourselves, so we are NOT "already having"
-    # addon/ltype in SQL. Let policy_filter_sql apply the rules from the question.
-    pol = policy_filter_sql(question, already_has_ltype=False, already_has_addon=False)
-    if pol:
-        where.append(pol)
-
+    # shared dimension filters (provider/product + generic)
+    where_dim = []
     if provider:
-        where.append(
-            f"LOWER(TRIM(CAST(ProviderName AS VARCHAR))) LIKE '%' || LOWER(TRIM({_safe_sql_literal(provider)})) || '%'"
+        where_dim.append(
+            f"LOWER(TRIM(CAST({qident(provider_col)} AS VARCHAR))) LIKE '%' || LOWER(TRIM({_safe_sql_literal(provider)})) || '%'"
         )
-
     if product:
-        where.append(
-            f"LOWER(TRIM(CAST(ProductName AS VARCHAR))) LIKE '%' || LOWER(TRIM({_safe_sql_literal(product)})) || '%'"
+        where_dim.append(
+            f"LOWER(TRIM(CAST({qident(product_col)} AS VARCHAR))) LIKE '%' || LOWER(TRIM({_safe_sql_literal(product)})) || '%'"
         )
-
     for col, val in generic_filters:
-        # don't double-apply provider/product if user typed them as generic filters too
-        if col and col.lower() in ("providername", "productname"):
+        if col in (provider_col, product_col):
             continue
-        if not col or col not in COLS:
-            continue
-        where.append(
-            f"LOWER(TRIM(CAST({qident(col)} AS VARCHAR))) LIKE '%' || LOWER(TRIM({_safe_sql_literal(val)})) || '%'"
-        )
+        if col and col in COLS:
+            where_dim.append(
+                f"LOWER(TRIM(CAST({qident(col)} AS VARCHAR))) LIKE '%' || LOWER(TRIM({_safe_sql_literal(val)})) || '%'"
+            )
+    where_dim_sql = " AND ".join(where_dim) if where_dim else "1=1"
 
-    where_sql = " AND ".join(where) if where else "1=1"
+    # months MUST include training months too
+    months_start = date_start
+    months_end = target_end
 
     sql = f"""
+WITH months AS (
+  SELECT STRFTIME('%Y-%m', d) AS month
+  FROM generate_series(
+    DATE '{months_start.isoformat()}',
+    DATE '{(months_end - dtmod.timedelta(days=1)).isoformat()}',
+    INTERVAL '1 month'
+  ) t(d)
+),
+
+sale_agg AS (
+  SELECT
+    STRFTIME('%Y-%m', TRY_CAST({qident(sale_date_col)} AS DATE)) AS month,
+
+    -- Total orders (confirmed)
+    SUM(CASE WHEN COALESCE(ConfirmedOrder,0)=1 THEN 1 ELSE 0 END) AS total_orders,
+
+    -- Installation orders (flag on the order)
+    SUM(CASE WHEN COALESCE(InstalledOrder,0)=1 THEN 1 ELSE 0 END) AS installation_orders,
+
+    -- Disconnection orders (has disconnect date) anchored to SaleDate for the rate denominator
+    SUM(CASE WHEN TRY_CAST({qident(disconnect_date_col)} AS TIMESTAMP) IS NOT NULL THEN 1 ELSE 0 END) AS disconnection_orders,
+
+    -- Revenue/profit on SaleDate
+    SUM(COALESCE({qident(revenue_col)},0)) AS revenue,
+    SUM(COALESCE({qident(profit_col)},0))  AS profit
+
+  FROM {TABLE}
+  WHERE
+    TRY_CAST({qident(sale_date_col)} AS DATE) >= DATE '{date_start.isoformat()}'
+    AND TRY_CAST({qident(sale_date_col)} AS DATE) <  DATE '{date_end.isoformat()}'
+    AND {where_dim_sql}
+  GROUP BY 1
+),
+
+install_agg AS (
+  SELECT
+    STRFTIME('%Y-%m', TRY_CAST({qident(install_date_col)} AS DATE)) AS month,
+    COUNT(*) AS installation_count
+  FROM {TABLE}
+  WHERE
+    TRY_CAST({qident(install_date_col)} AS DATE) >= DATE '{date_start.isoformat()}'
+    AND TRY_CAST({qident(install_date_col)} AS DATE) <  DATE '{date_end.isoformat()}'
+    AND {where_dim_sql}
+  GROUP BY 1
+),
+
+disc_agg AS (
+  SELECT
+    STRFTIME('%Y-%m', TRY_CAST({qident(disconnect_date_col)} AS DATE)) AS month,
+    COUNT(*) AS disconnection_count
+  FROM {TABLE}
+  WHERE
+    TRY_CAST({qident(disconnect_date_col)} AS DATE) >= DATE '{date_start.isoformat()}'
+    AND TRY_CAST({qident(disconnect_date_col)} AS DATE) <  DATE '{date_end.isoformat()}'
+    AND {where_dim_sql}
+  GROUP BY 1
+)
+
 SELECT
-  STRFTIME('%Y-%m', CAST(SaleDate AS DATE)) AS month,
+  m.month,
 
-  SUM(CASE WHEN COALESCE(ConfirmedOrder,0)=1 THEN 1 ELSE 0 END) AS total_orders,
+  COALESCE(s.total_orders, 0) AS total_orders,
+  COALESCE(s.installation_orders, 0) AS installation_orders,
 
-  SUM(CASE WHEN COALESCE(InstalledOrder,0)=1 THEN 1 ELSE 0 END) AS installation_orders,
-  ROUND(
-    SUM(CASE WHEN COALESCE(InstalledOrder,0)=1 THEN 1 ELSE 0 END) * 100.0 /
-    NULLIF(SUM(CASE WHEN COALESCE(ConfirmedOrder,0)=1 THEN 1 ELSE 0 END), 0),
-    2
+  -- Installation Rate = installation_orders / total_orders
+  COALESCE(
+    ROUND(COALESCE(s.installation_orders,0) * 100.0 / NULLIF(COALESCE(s.total_orders,0), 0), 2),
+    0
   ) AS installation_rate,
 
-  SUM(CASE WHEN TRY_CAST(DisconnectDate AS TIMESTAMP) IS NOT NULL THEN 1 ELSE 0 END) AS disconnection_orders,
-  ROUND(
-    SUM(CASE WHEN TRY_CAST(DisconnectDate AS TIMESTAMP) IS NOT NULL THEN 1 ELSE 0 END) * 100.0 /
-    NULLIF(SUM(CASE WHEN COALESCE(ConfirmedOrder,0)=1 THEN 1 ELSE 0 END), 0),
-    2
+  COALESCE(s.disconnection_orders, 0) AS disconnection_orders,
+
+  -- Disconnection Rate = disconnection_orders / total_orders
+  COALESCE(
+    ROUND(COALESCE(s.disconnection_orders,0) * 100.0 / NULLIF(COALESCE(s.total_orders,0), 0), 2),
+    0
   ) AS disconnection_rate,
 
-  SUM(COALESCE(NetAfterChargeback,0)) AS revenue,
-  SUM(COALESCE(Profit,0)) AS profit,
+  COALESCE(i.installation_count, 0) AS installation_count,
+  COALESCE(d.disconnection_count, 0) AS disconnection_count,
 
-  ROUND(
-    SUM(COALESCE(Profit,0)) * 100.0 /
-    NULLIF(SUM(COALESCE(NetAfterChargeback,0)), 0),
-    2
+  COALESCE(s.revenue, 0) AS revenue,
+  COALESCE(s.profit, 0)  AS profit,
+
+  COALESCE(
+    ROUND(COALESCE(s.profit,0) * 100.0 / NULLIF(COALESCE(s.revenue,0), 0), 2),
+    0
   ) AS profit_rate
 
-FROM {TABLE}
-WHERE {where_sql}
-GROUP BY 1
-ORDER BY 1
+FROM months m
+LEFT JOIN sale_agg    s ON s.month = m.month
+LEFT JOIN install_agg i ON i.month = m.month
+LEFT JOIN disc_agg    d ON d.month = m.month
+ORDER BY m.month
 """.strip()
 
     return sql, target_filter
-
 
 def _month_to_index(ym: str) -> int:
     try:
@@ -1043,10 +924,14 @@ def _month_to_index(ym: str) -> int:
     except Exception:
         return None
 
-def add_estimated_columns(df: pd.DataFrame, cols_to_estimate, window=12):
+def add_estimated_columns(df: pd.DataFrame, cols_to_estimate, window=12, mode: str = "always"):
     """
     Adds estimated_<col> using rolling Linear Regression.
     Predicts each month using ONLY previous months.
+
+    mode:
+      - "always":   compute an estimate for every month (after at least 1-2 history points)
+      - "missing":  only estimate when actual is missing (NaN)
     """
     if df is None or df.empty or "month" not in df.columns:
         return df
@@ -1055,16 +940,28 @@ def add_estimated_columns(df: pd.DataFrame, cols_to_estimate, window=12):
     df["__t"] = df["month"].astype(str).apply(_month_to_index)
     df = df.sort_values("__t").reset_index(drop=True)
 
+    mode = (mode or "always").strip().lower()
+    if mode not in ("always", "missing"):
+        mode = "always"
+
     for col in cols_to_estimate:
         est_col = f"estimated_{col}"
         df[est_col] = np.nan
         if col not in df.columns:
             continue
 
-        y_all = pd.to_numeric(df[col], errors="coerce").values
-        t_all = df["__t"].values
+        y_all = pd.to_numeric(df[col], errors="coerce").values.astype(float)
+        t_all = pd.to_numeric(df["__t"], errors="coerce").values.astype(float)
 
         for i in range(len(df)):
+            # "missing" mode: only estimate if actual is missing
+            if mode == "missing" and np.isfinite(y_all[i]):
+                continue
+
+            # always needs prior history
+            if i <= 0 or not np.isfinite(t_all[i]):
+                continue
+
             start_i = max(0, i - window)
             X_hist = t_all[start_i:i]
             y_hist = y_all[start_i:i]
@@ -1073,22 +970,66 @@ def add_estimated_columns(df: pd.DataFrame, cols_to_estimate, window=12):
             X_hist = X_hist[mask]
             y_hist = y_hist[mask]
 
-            if len(X_hist) < 3:
+            if len(X_hist) == 0:
+                continue
+
+            # 1 point: carry-forward
+            if len(X_hist) == 1:
+                df.loc[i, est_col] = float(y_hist[0])
                 continue
 
             model = LinearRegression()
             model.fit(X_hist.reshape(-1, 1), y_hist)
 
-            t_pred = t_all[i]
-            if not np.isfinite(t_pred):
-                continue
-
-            pred = model.predict(np.array([[t_pred]]))[0]
+            pred = model.predict(np.array([[t_all[i]]], dtype=float))[0]
             df.loc[i, est_col] = float(pred)
 
         df[est_col] = pd.to_numeric(df[est_col], errors="coerce").round(2)
 
     df.drop(columns=["__t"], inplace=True, errors="ignore")
+    return df
+
+def add_estimated_rate_columns(df: pd.DataFrame):
+    """
+    Only derive rate estimates from estimated numerators/denominators
+    when the estimated rate column is NOT already present.
+
+    IMPORTANT FIX:
+    - Do NOT derive estimated_profit_rate from estimated_profit/estimated_revenue.
+      Profit rate should be estimated directly from the profit_rate series.
+    """
+    if df is None or df.empty:
+        return df
+
+    df = df.copy()
+
+    # installation_rate = installation_orders / total_orders
+    if ("estimated_installation_rate" not in df.columns and
+        "estimated_installation_orders" in df.columns and
+        "estimated_total_orders" in df.columns):
+        denom = pd.to_numeric(df["estimated_total_orders"], errors="coerce").astype(float)
+        numer = pd.to_numeric(df["estimated_installation_orders"], errors="coerce").astype(float)
+        df["estimated_installation_rate"] = np.where(
+            denom > 0,
+            (numer * 100.0 / denom),
+            np.nan
+        )
+        df["estimated_installation_rate"] = pd.to_numeric(df["estimated_installation_rate"], errors="coerce").round(2)
+
+    # disconnection_rate = disconnection_orders / total_orders
+    if ("estimated_disconnection_rate" not in df.columns and
+        "estimated_disconnection_orders" in df.columns and
+        "estimated_total_orders" in df.columns):
+        denom = pd.to_numeric(df["estimated_total_orders"], errors="coerce").astype(float)
+        numer = pd.to_numeric(df["estimated_disconnection_orders"], errors="coerce").astype(float)
+        df["estimated_disconnection_rate"] = np.where(
+            denom > 0,
+            (numer * 100.0 / denom),
+            np.nan
+        )
+        df["estimated_disconnection_rate"] = pd.to_numeric(df["estimated_disconnection_rate"], errors="coerce").round(2)
+
+    # NOTE: profit rate MUST be estimated directly from profit_rate series.
     return df
 
 def _explain_trend(df: pd.DataFrame, est_col: str, window: int):
@@ -1118,25 +1059,26 @@ def build_prediction_reply(df_out: pd.DataFrame, cols_to_estimate, window: int):
 # LLM HELPERS
 # -------------------------------------------------
 def ask_model_for_sql(question: str, schema_cols: list, sample_rows: pd.DataFrame) -> str:
-    """
-    Ask the LLM to decide:
-    - if the question is about the dataset → return one DuckDB SELECT.
-    - if not → return NO_SQL.
-    """
     try:
         schema_info = f"Columns: {', '.join(schema_cols)}"
         sample_info = sample_rows.head(10).to_csv(index=False) if not sample_rows.empty else "No sample data"
 
-        date_col = get_date_col()
+        sale_date_col = get_sale_date_col() or "SaleDate"
+        install_date_col = get_install_date_col() or "InstallDate"
+        disconnect_date_col = get_disconnect_date_col() or "DisconnectDate"
+
+        # FIX: date_col must exist
+        date_col = get_date_col() or sale_date_col
+
         rev_col = get_revenue_col()
         profit_col = get_profit_col()
 
-        # extra semantic hints
         semantic_lines = []
+
         if CUST_FIRST_COL and CUST_LAST_COL:
             semantic_lines.append(
                 f"- CustomerFirstName + CustomerLastName together form the full customer name.\n"
-                f"  When the user says 'customer name' or 'customer names' or 'customer' , use "
+                f"  When the user says 'customer name' or 'customer names' or 'customer', use "
                 f"TRIM({CUST_FIRST_COL}) || ' ' || TRIM({CUST_LAST_COL}) as CustomerName and "
                 f"exclude rows where both are NULL or empty."
             )
@@ -1145,10 +1087,31 @@ def ask_model_for_sql(question: str, schema_cols: list, sample_rows: pd.DataFram
                 f"group by Account (or Account-like column) and use "
                 f"HAVING COUNT(DISTINCT TRIM({CUST_FIRST_COL}) || ' ' || TRIM({CUST_LAST_COL})) > 1."
             )
+
         semantic_lines.append(
             "- If the user asks for 'any N X' or 'sample N X values', use SELECT DISTINCT on that "
             "column or expression, filter out NULL/empty values, and LIMIT N."
         )
+
+        semantic_lines.append(
+            "- DATE RULES:\n"
+            f"  • SaleDate (anchor for most rollups and rates): {sale_date_col}\n"
+            f"  • Installation COUNT (completed installs): use InstallDate: {install_date_col}\n"
+            f"  • Disconnection COUNT: use DisconnectDate: {disconnect_date_col}\n"
+            "  • If the user asks for multiple metrics together, anchor grouping/filtering on SaleDate.\n"
+        )
+
+        semantic_lines.append(
+            "- IMPORTANT DEFINITIONS (use these exactly):\n"
+            "  • Total Orders = SUM(CASE WHEN COALESCE(ConfirmedOrder,0)=1 THEN 1 ELSE 0 END)\n"
+            "  • Installation Orders = SUM(CASE WHEN COALESCE(InstalledOrder,0)=1 THEN 1 ELSE 0 END)\n"
+            "  • Installation Rate = Installation Orders / Total Orders\n"
+            f"  • Disconnection Orders = SUM(CASE WHEN {disconnect_date_col} IS NOT NULL THEN 1 ELSE 0 END)\n"
+            "  • Disconnection Rate = Disconnection Orders / Total Orders\n"
+            "  • Profit Rate (%) = SUM(Profit)*100.0 / NULLIF(SUM(Revenue),0)\n"
+            "  • If user asks 'installation and installation rate', treat 'installation' as Installation Orders (NOT InstallDate count).\n"
+        )
+
         extra_semantics = "\n".join(semantic_lines)
 
         prompt = rf"""
@@ -1172,7 +1135,10 @@ Table name: {TABLE}
 Usable columns (ONLY these): {', '.join(schema_cols)}
 
 Business meaning hints (if these columns exist):
-- Date column: {date_col}
+- Default date column: {date_col}
+- SaleDate column (preferred anchor): {sale_date_col}
+- InstallDate column (for installation counts): {install_date_col}
+- DisconnectDate column (for disconnection counts): {disconnect_date_col}
 - Revenue column (money received): {rev_col}
 - Profit column (net profit): {profit_col}
 
@@ -1180,21 +1146,14 @@ Additional semantic hints:
 {extra_semantics or '- (none)'}
 
 Technical rules:
-- When you work with dates, ALWAYS cast the date column to DATE first:
-  CAST({date_col} AS DATE)
-  (Assume {date_col} is stored as text and must be cast.)
+- When you work with dates, ALWAYS cast the chosen date column to DATE first:
+  CAST(chosen_date_col AS DATE)
 - For year-month buckets:
-  STRFTIME('%Y-%m', CAST({date_col} AS DATE))
+  STRFTIME('%Y-%m', CAST(chosen_date_col AS DATE))
 - For year-only buckets:
-  STRFTIME('%Y', CAST({date_col} AS DATE))
-- When filtering on dates (last month, a specific month/year, etc.), always compare using CAST({date_col} AS DATE), e.g.:
-  WHERE CAST({date_col} AS DATE) >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '1 month'
-    AND CAST({date_col} AS DATE) <  DATE_TRUNC('month', CURRENT_DATE)
-  or for October 2025:
-  WHERE CAST({date_col} AS DATE) >= DATE '2025-10-01'
-    AND CAST({date_col} AS DATE) <  DATE '2025-11-01'
+  STRFTIME('%Y', CAST(chosen_date_col AS DATE))
 - Do NOT invent aliases like date_col_expr unless you define them in the SELECT/FROM.
-  If you want to reuse the expression, just repeat CAST({date_col} AS DATE) wherever needed.
+  If you want to reuse the expression, just repeat CAST(chosen_date_col AS DATE) wherever needed.
 - For case-insensitive text comparison:
   LOWER(TRIM(CAST(col AS VARCHAR))) = LOWER(TRIM('value'))
 - When returning names or values for a column, prefer to exclude NULL or empty strings:
@@ -1211,30 +1170,9 @@ Technical rules:
   3. ORDER BY the aggregated metric (DESC for top, ASC for bottom)
   4. Apply LIMIT N
 
-- IMPORTANT Addon/Ltype policy:
-  1) Default (no addon mentioned at all):
-     ALWAYS filter rows where (Ltype = 'L' OR Ltype IS NULL).
-  2) If user mentions "addon" (addon/add-on/add on) WITHOUT specifying a value:
-     treat it as addon-mode and filter rows where Ltype = 'A'.
-  3) If user explicitly says addon = 1:
-     filter rows where Addon = 1
-     and DO NOT force any Ltype (unless the user explicitly asks Ltype).
-  4) If user explicitly says addon = 0:
-     filter rows where Addon = 0
-     and behave like default for Ltype again (Ltype='L' OR NULL), unless the user explicitly asks Ltype.
-  5) If user explicitly asks Ltype (e.g. Ltype = 'A') then respect that and do not override it.
-
 - IMPORTANT: If the user asks for estimate/prediction/forecast/projected values, return NO_SQL.
 - If the question wants raw row details (not aggregation), include LIMIT {MAX_ROWS}, unless the user explicitly asks for "all ...".
 - If the question is purely conceptual/theory (definitions, explanations) without needing actual table values, return NO_SQL.
-- If the user asks for a chart, graph, plot, distribution, comparison, or "by <something>":
-  return an aggregated result suitable for visualization.
-  Prefer:
-  • 1 numeric column → histogram
-  • 2 numeric columns → scatter plot
-  • 1 category + 1 numeric → pie or bar
-  • 1 category + multiple numeric columns → stacked bar
-  Do NOT return raw row-level data in these cases.
 
 Schema:
 {schema_info}
@@ -1269,67 +1207,91 @@ Now output either:
     except Exception as e:
         print(f"Error generating SQL: {e}", traceback.format_exc())
         return "NO_SQL"
-
-def ask_model_fix_sql(bad_sql: str, error: str, schema_cols: list, sample_rows: pd.DataFrame) -> str:
-    """Ask LLM to fix problematic SQL."""
+def ask_model_fix_sql(bad_sql: str, error_text: str, schema_cols: list, sample_rows: pd.DataFrame) -> str:
+    """
+    Attempt to fix a failing DuckDB SELECT query using the LLM.
+    Returns a safe SELECT query string or NO_SQL.
+    """
     try:
-        date_col = get_date_col()
+        schema_info = f"Columns: {', '.join(schema_cols)}"
+        sample_info = sample_rows.head(10).to_csv(index=False) if not sample_rows.empty else "No sample data"
 
-        if date_col:
-            date_fix_rules = f"""
-- If you compare the date column {date_col} to CURRENT_DATE or use DATE_TRUNC,
-  ALWAYS wrap it as TRY_CAST({date_col} AS DATE).
-  Example:
-    WHERE TRY_CAST({date_col} AS DATE) >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '1 month'
-"""
-        else:
-            date_fix_rules = """
-- Do NOT introduce date filters unless the user explicitly requires them and a real date
-  column name from the schema is used.
-"""
+        sale_date_col = get_sale_date_col() or "SaleDate"
+        install_date_col = get_install_date_col() or "InstallDate"
+        disconnect_date_col = get_disconnect_date_col() or "DisconnectDate"
+        date_col = get_date_col() or sale_date_col
+
+        rev_col = get_revenue_col()
+        profit_col = get_profit_col()
 
         prompt = rf"""
-The following DuckDB SQL query failed with error: {error}
+You are an assistant that fixes DuckDB SQL for a single table called {TABLE}.
 
-Broken SQL:
+You will be given:
+1) A SQL query that FAILED
+2) The DuckDB error message
+3) The allowed schema columns
+4) A tiny sample of data
+
+Your job:
+- Return exactly ONE corrected DuckDB SELECT statement that will run.
+- Do NOT return explanations, markdown, or comments.
+- If it cannot be fixed safely, return exactly: NO_SQL
+
+Hard rules:
+- Output must be a single SELECT statement (first keyword must be SELECT).
+- Only use this table: {TABLE}
+- Only use these columns: {', '.join(schema_cols)}
+- Do NOT use INSERT/UPDATE/DELETE/DROP/ALTER/CREATE/REPLACE.
+- Do NOT reference other tables, files, or schemas.
+- If you need dates, CAST the chosen date column AS DATE.
+- If the original query had an alias/column that doesn't exist, replace it with the closest valid column from schema.
+- If there is an ambiguous column name, pick the best match from schema_cols.
+
+Helpful business hints:
+- Default date column: {date_col}
+- SaleDate (anchor): {sale_date_col}
+- InstallDate: {install_date_col}
+- DisconnectDate: {disconnect_date_col}
+- Revenue column: {rev_col}
+- Profit column: {profit_col}
+
+FAILED SQL:
 {bad_sql}
 
-The table name is {TABLE}.
-Usable columns: {', '.join(schema_cols)}
+DUCKDB ERROR:
+{error_text}
 
-Fix the SQL so it works in DuckDB, while respecting these rules:
-- Only a single SELECT statement.
-- No INSERT/UPDATE/DELETE/DDL.
-- Use only the listed columns.
-- NEVER invent or use fake column names like "date_col_expr".
-- Do not change the user's intent.
+Schema:
+{schema_info}
 
-Additional rules for dates:
-{date_fix_rules}
+Tiny sample:
+{sample_info}
 
-If you need to compare a date-like column (e.g. the main date column), you must:
-- Wrap it with TRY_CAST(column AS DATE) before comparing to CURRENT_DATE or using DATE_TRUNC.
-
-Return ONLY the fixed SQL or NO_SQL. No explanations, no markdown.
+Now output ONLY one corrected SELECT query, or NO_SQL.
 """
+
         response = client.chat.completions.create(
             model=CHAT_MODEL,
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,
-            max_tokens=600,
+            temperature=0.0,
+            max_tokens=700,
         )
 
-        fixed_sql = (response.choices[0].message.content or "").strip()
-        fixed_sql = re.sub(r"^```(?:sql)?\s*|\s*```$", "", fixed_sql, flags=re.IGNORECASE).strip()
+        fixed = (response.choices[0].message.content or "").strip()
+        fixed = re.sub(r"^```(?:sql)?\s*|\s*```$", "", fixed, flags=re.IGNORECASE).strip()
 
-        if fixed_sql.upper() == "NO_SQL":
+        if fixed.upper() == "NO_SQL":
             return "NO_SQL"
-        if not is_safe_select(fixed_sql):
+
+        # enforce safety: must be SELECT-only
+        if not is_safe_select(fixed):
             return "NO_SQL"
-        return fixed_sql
+
+        return fixed
 
     except Exception as e:
-        print(f"Error fixing SQL: {e}", traceback.format_exc())
+        print("ask_model_fix_sql error:", e, traceback.format_exc())
         return "NO_SQL"
 
 def answer_theory_question(question: str):
@@ -1378,10 +1340,9 @@ def handle_general_data_question(question: str, history=None):
     """
     schema_cols = COLS
     qlow = (question or "").lower()
-
-    # -------------------------------------------------
-    # PREDICTION MODE (bypass LLM SQL and do stable month-wise SQL + ML)
-    # -------------------------------------------------
+# -------------------------------------------------
+# PREDICTION MODE (bypass LLM SQL and do stable month-wise SQL + ML)
+# -------------------------------------------------
     prediction_mode = is_prediction_request(question)
     if prediction_mode:
         try:
@@ -1389,61 +1350,87 @@ def handle_general_data_question(question: str, history=None):
             df = run_sql_and_fetch_df(pred_sql)
 
             ql = (question or "").lower()
-            cols_to_estimate = []
 
-            # Map metric display names to df column names
-            # IMPORTANT: keep "profit rate" BEFORE "profit" to avoid wrong matching
-            metric_map = {
-                "total orders": "total_orders",
-                "total order": "total_orders",
+            # normalize wording so estimate detection works consistently
+            ql = ql.replace("disconnected rate", "disconnection rate")
+            ql = ql.replace("disconnect rate", "disconnection rate")
 
-                "installation orders": "installation_orders",
-                "installation order": "installation_orders",
-                "installed orders": "installation_orders",
-                "installed order": "installation_orders",
+            # -----------------------------
+            # IMPORTANT:
+            # User often says "installation" (not "installation orders").
+            # For prediction-mode output selection, treat "installation" as installation_orders
+            # unless they explicitly say "installation count".
+            # -----------------------------
+            def _wants_installation_wording(q: str) -> bool:
+                return bool(re.search(r"\binstallation\b", q)) and not any(
+                    p in q for p in [
+                        "installation rate", "install rate",
+                        "installation order", "installation orders",
+                        "installed order", "installed orders",
+                        "installation count", "installed count",
+                    ]
+                )
 
-                "installation rate": "installation_rate",
-                "install rate": "installation_rate",
+            # -----------------------------
+            # 1) Decide what the user ACTUALLY wants estimated (VISIBLE only)
+            # -----------------------------
+            visible_est = []
 
-                "disconnection orders": "disconnection_orders",
-                "disconnection order": "disconnection_orders",
-                "disconnected orders": "disconnection_orders",
-                "disconnected order": "disconnection_orders",
+            if _wants_estimate_for_metric(ql, "profit rate"):
+                visible_est.append("profit_rate")
+            if _wants_estimate_for_metric(ql, "revenue"):
+                visible_est.append("revenue")
+            # profit: only if user asked "estimated profit" and NOT just "profit rate"
+            if _wants_estimate_for_metric(ql, "profit") and ("profit rate" not in ql):
+                visible_est.append("profit")
+            if _wants_estimate_for_metric(ql, "installation rate"):
+                visible_est.append("installation_rate")
+            if _wants_estimate_for_metric(ql, "disconnection rate"):
+                visible_est.append("disconnection_rate")
+            if _wants_estimate_for_metric(ql, "total orders"):
+                visible_est.append("total_orders")
+            if _wants_estimate_for_metric(ql, "installation orders"):
+                visible_est.append("installation_orders")
+            if _wants_estimate_for_metric(ql, "disconnection orders"):
+                visible_est.append("disconnection_orders")
 
-                "disconnection rate": "disconnection_rate",
-                "disconnect rate": "disconnection_rate",
-                "disconnected rate": "disconnection_rate",
+            # dedupe preserve order
+            try:
+                visible_est = list(dict.fromkeys(visible_est))
+            except Exception:
+                pass
 
-                "profit rate": "profit_rate",
-                "profit": "profit",
-                "revenue": "revenue",
-            }
+            # -----------------------------
+            # 2) Internal estimation columns (helpers) — compute them, but DON'T show unless asked
+            # -----------------------------
+            internal_est = list(visible_est)
 
-            # Only estimate metrics the user EXPLICITLY requested as estimated/forecast/predicted
-            for phrase, col in metric_map.items():
-                if _wants_estimate_for_metric(ql, phrase):
-                    cols_to_estimate.append(col)
+            # If user asked estimated installation_rate, compute helper series internally
+            if "installation_rate" in internal_est:
+                for x in ["installation_orders", "total_orders"]:
+                    if x not in internal_est:
+                        internal_est.append(x)
 
-            # dedupe cols_to_estimate (prevents repeated trend lines)
-            cols_to_estimate = list(dict.fromkeys(cols_to_estimate))
+            # If user asked estimated disconnection_rate, compute helper series internally
+            if "disconnection_rate" in internal_est:
+                for x in ["disconnection_orders", "total_orders"]:
+                    if x not in internal_est:
+                        internal_est.append(x)
 
-            # If user asked for estimates generally but didn't specify metric: conservative fallback
-            if not cols_to_estimate and _wants_any_estimates(ql):
-                if "installation rate" in ql or "install rate" in ql:
-                    cols_to_estimate = ["installation_rate"]
-                elif "disconnection rate" in ql or "disconnect rate" in ql or "disconnected rate" in ql:
-                    cols_to_estimate = ["disconnection_rate"]
-                elif "profit rate" in ql:
-                    cols_to_estimate = ["profit_rate"]
-                elif "profit" in ql:
-                    cols_to_estimate = ["profit"]
-                elif "order" in ql or "orders" in ql:
-                    cols_to_estimate = ["total_orders"]
-                else:
-                    cols_to_estimate = ["installation_rate"]
+            # dedupe preserve order
+            try:
+                internal_est = list(dict.fromkeys(internal_est))
+            except Exception:
+                pass
 
             window = 12
-            df2 = add_estimated_columns(df, cols_to_estimate, window=window)
+
+            # mode="always" computes estimated_* for ALL months using past data,
+            # even when actual values exist (your SQL COALESCE makes them non-null).
+            df2 = add_estimated_columns(df, internal_est, window=window, mode="always")
+
+            # derive estimated_installation_rate / estimated_disconnection_rate if possible
+            df2 = add_estimated_rate_columns(df2)
 
             # Filter output to target (month or year)
             df_out = df2.copy()
@@ -1455,68 +1442,87 @@ def handle_general_data_question(question: str, history=None):
                 _, y = target_filter
                 df_out = df_out[df_out["month"].astype(str).str.startswith(f"{y:04d}-")]
 
-            # --------- OUTPUT COLUMN SELECTION (FIXED: no extra columns) ----------
+            if df_out is None or df_out.empty:
+                debug_hint = (
+                    "No rows match those filters in the training/target window. "
+                    "Try checking distinct values (e.g., 'show me distinct ProviderName') or relax filters."
+                )
+                return {
+                    "reply": f"Estimates are generated using rolling Linear Regression on the previous {window} months (past data only).\n{debug_hint}",
+                    "table_html": "<p><i>No data</i></p>",
+                    "plot_data_uri": None,
+                    "rows_returned": 0,
+                    "truncated": False,
+                    "download_url": None,
+                }
+
+            # --------- OUTPUT COLUMN SELECTION (NO EXTRA COLUMNS) ----------
             wants_total_orders = ("total order" in ql) or ("total orders" in ql) or bool(re.search(r"\btotal\s+orders?\b", ql))
 
             wants_install_orders = any(p in ql for p in ["installation order", "installation orders", "installed order", "installed orders"])
             wants_install_rate = any(p in ql for p in ["installation rate", "install rate"])
 
+            # "installation" (alone) should behave like installation_orders
+            if _wants_installation_wording(ql):
+                wants_install_orders = True
+
             wants_disc_orders = any(p in ql for p in ["disconnection order", "disconnection orders", "disconnected order", "disconnected orders"])
             wants_disc_rate = any(p in ql for p in ["disconnection rate", "disconnect rate", "disconnected rate"])
 
             wants_revenue = "revenue" in ql
-            wants_profit = ("profit" in ql)  # includes profit rate too
             wants_profit_rate = ("profit rate" in ql)
+
+            asked_profit_explicit = bool(re.search(r"\bprofit\b\s*(?:,|and|&)", ql)) or bool(re.search(r"(?:,|and|&)\s*profit\b", ql))
+            wants_profit = asked_profit_explicit or (bool(re.search(r"\bprofit\b", ql)) and not wants_profit_rate)
 
             base_cols = ["month"]
 
-            # total orders (only if asked OR if its estimate is requested)
-            if wants_total_orders or ("total_orders" in cols_to_estimate):
+            # total orders (only if asked OR if user explicitly requested its estimate)
+            if wants_total_orders or ("total_orders" in visible_est):
                 base_cols += ["total_orders"]
-                if "total_orders" in cols_to_estimate:
+                if "total_orders" in visible_est and "estimated_total_orders" in df_out.columns:
                     base_cols += ["estimated_total_orders"]
 
             # installation orders (only if asked OR estimate requested)
-            if wants_install_orders or ("installation_orders" in cols_to_estimate):
+            if wants_install_orders or ("installation_orders" in visible_est):
                 base_cols += ["installation_orders"]
-                if "installation_orders" in cols_to_estimate:
+                if "installation_orders" in visible_est and "estimated_installation_orders" in df_out.columns:
                     base_cols += ["estimated_installation_orders"]
 
             # installation rate (only if asked OR estimate requested)
-            if wants_install_rate or ("installation_rate" in cols_to_estimate):
+            if wants_install_rate or ("installation_rate" in visible_est):
                 base_cols += ["installation_rate"]
-                if "installation_rate" in cols_to_estimate:
+                if ("installation_rate" in visible_est) and ("estimated_installation_rate" in df_out.columns):
                     base_cols += ["estimated_installation_rate"]
 
             # disconnection orders (only if asked OR estimate requested)
-            if wants_disc_orders or ("disconnection_orders" in cols_to_estimate):
+            if wants_disc_orders or ("disconnection_orders" in visible_est):
                 base_cols += ["disconnection_orders"]
-                if "disconnection_orders" in cols_to_estimate:
+                if "disconnection_orders" in visible_est and "estimated_disconnection_orders" in df_out.columns:
                     base_cols += ["estimated_disconnection_orders"]
 
             # disconnection rate (only if asked OR estimate requested)
-            if wants_disc_rate or ("disconnection_rate" in cols_to_estimate):
+            if wants_disc_rate or ("disconnection_rate" in visible_est):
                 base_cols += ["disconnection_rate"]
-                if "disconnection_rate" in cols_to_estimate:
+                if ("disconnection_rate" in visible_est) and ("estimated_disconnection_rate" in df_out.columns):
                     base_cols += ["estimated_disconnection_rate"]
 
             # revenue (only if asked OR estimate requested)
-            if wants_revenue or ("revenue" in cols_to_estimate):
+            if wants_revenue or ("revenue" in visible_est):
                 base_cols += ["revenue"]
-                if "revenue" in cols_to_estimate:
+                if "revenue" in visible_est and "estimated_revenue" in df_out.columns:
                     base_cols += ["estimated_revenue"]
 
             # profit (only if asked OR estimate requested)
-            if (wants_profit and not wants_profit_rate) or ("profit" in cols_to_estimate):
-                # if user only asked profit rate, don't force profit unless estimated profit requested
+            if (wants_profit and not wants_profit_rate) or ("profit" in visible_est):
                 base_cols += ["profit"]
-                if "profit" in cols_to_estimate:
+                if "profit" in visible_est and "estimated_profit" in df_out.columns:
                     base_cols += ["estimated_profit"]
 
             # profit rate (only if asked OR estimate requested)
-            if wants_profit_rate or ("profit_rate" in cols_to_estimate):
+            if wants_profit_rate or ("profit_rate" in visible_est):
                 base_cols += ["profit_rate"]
-                if "profit_rate" in cols_to_estimate:
+                if ("profit_rate" in visible_est) and ("estimated_profit_rate" in df_out.columns):
                     base_cols += ["estimated_profit_rate"]
 
             # dedupe while preserving order and keep only existing cols
@@ -1529,8 +1535,11 @@ def handle_general_data_question(question: str, history=None):
 
             df_out = df_out[final_cols] if final_cols else df_out
             df_out = apply_hidden_cols_policy(df_out, question)
+
             table_html = rows_to_html_table(df_out.to_dict(orient="records")) if not df_out.empty else "<p><i>No data</i></p>"
-            reply_text = build_prediction_reply(df_out, cols_to_estimate, window=window)
+
+            # Trend lines ONLY for what the user asked to estimate (visible_est)
+            reply_text = build_prediction_reply(df_out, visible_est, window=window)
 
             result = {
                 "reply": reply_text,
@@ -1541,7 +1550,6 @@ def handle_general_data_question(question: str, history=None):
                 "download_url": None,
             }
 
-            # IMPORTANT: return actual SQL used in prediction mode (so you don't get fake LLM SQL)
             if DEBUG_SQL:
                 result["debug_sql"] = pred_sql
                 try:
@@ -1554,6 +1562,7 @@ def handle_general_data_question(question: str, history=None):
         except Exception as e:
             _log_and_mask_error(e, "prediction_mode")
             return _safe_user_error("Prediction failed due to an internal error. Please try again with fewer filters.")
+
 
     # --- conversation-aware context ---
     history = history or []
@@ -1598,9 +1607,10 @@ def handle_general_data_question(question: str, history=None):
             "plot_data_uri": None,
         }
     # --- END ambiguous time block ---
+
     try:
         with _get_duck_con() as local_con:
-            sample_rows = local_con.execute(f"SELECT * FROM {TABLE} LIMIT 10").fetchdf()
+            sample_rows = local_con.execute(f"SELECT * FROM {TABLE} LIMIT 50").fetchdf()
     except Exception:
         sample_rows = SAMPLE_DF if not SAMPLE_DF.empty else pd.DataFrame(columns=COLS)
 
@@ -1609,20 +1619,10 @@ def handle_general_data_question(question: str, history=None):
     # -------------------------------------------------
     key_col, key_val, key_lim = _extract_key_lookup(question)
     if key_col and key_val:
-        # For key lookup, also respect explicit Ltype/addon constraints by applying policy_filter_sql
-        # If user explicitly wrote Ltype in the question, we do not override it (so skip Ltype injection here)
-        ql2 = (question or "").lower()
-        key_policy = policy_filter_sql(
-            question,
-            already_has_ltype=("ltype" in ql2),
-            already_has_addon=("addon" in ql2),
-        )
-        key_policy_sql = f"WHERE {key_policy}\n          AND " if key_policy else "WHERE "
-
         sql_text = f"""
         SELECT *
         FROM {TABLE}
-        {key_policy_sql}LOWER(TRIM(CAST({qident(key_col)} AS VARCHAR))) = LOWER(TRIM({_safe_sql_literal(key_val)}))
+        WHERE LOWER(TRIM(CAST({qident(key_col)} AS VARCHAR))) = LOWER(TRIM({_safe_sql_literal(key_val)}))
         LIMIT {int(key_lim)}
         """.strip()
 
@@ -1648,7 +1648,6 @@ def handle_general_data_question(question: str, history=None):
 
     # 1) Ask model for SQL  (conversation-aware)
     sql_text = ask_model_for_sql(augmented_question, schema_cols, sample_rows)
-    sql_text = apply_ltype_policy_to_sql(sql_text, question)
 
     # 2) If NO_SQL → theory/general mode (conversation-aware)
     if not sql_text or sql_text.strip().upper() == "NO_SQL":
@@ -1680,7 +1679,6 @@ def handle_general_data_question(question: str, history=None):
                 fixed = ask_model_fix_sql(sql_text, last_error, schema_cols, sample_rows)
                 if fixed and fixed.strip().upper() != "NO_SQL":
                     sql_text = fixed.strip()
-                    sql_text = apply_ltype_policy_to_sql(sql_text, question)
                     try_count += 1
                     continue
             _log_and_mask_error(last_error, "sql_execution")
@@ -1711,6 +1709,7 @@ def handle_general_data_question(question: str, history=None):
     if MAX_ROWS and total_rows > MAX_ROWS:
         truncated = True
         df_preview = df.head(MAX_ROWS)
+
     df_preview = apply_hidden_cols_policy(df_preview, question)
     if not df_preview.empty:
         table_html = rows_to_html_table(df_preview.to_dict(orient="records"))
@@ -1744,9 +1743,7 @@ def handle_general_data_question(question: str, history=None):
             num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
             cat_cols = [c for c in df.columns if c not in num_cols]
 
-            # -------------------------
             # USER-FORCED CHART
-            # -------------------------
             if kind == "hist" and num_cols:
                 plot_uri = plot_to_base64([], df[num_cols[0]].tolist(), kind="hist", title=question)
 
@@ -1784,15 +1781,10 @@ def handle_general_data_question(question: str, history=None):
                     title=question,
                 )
 
-            # -------------------------
             # AUTO CHART (if no force)
-            # -------------------------
             if plot_uri is None:
-                # 1 numeric → histogram
                 if len(num_cols) == 1:
                     plot_uri = plot_to_base64([], df[num_cols[0]].tolist(), kind="hist", title=question)
-
-                # 2 numeric → scatter
                 elif len(num_cols) == 2 and not cat_cols:
                     plot_uri = plot_to_base64(
                         df[num_cols[0]].tolist(),
@@ -1800,14 +1792,10 @@ def handle_general_data_question(question: str, history=None):
                         kind="scatter",
                         title=question,
                     )
-
-                # category + 2+ numeric → stacked bar
                 elif cat_cols and len(num_cols) >= 2:
                     labels = df[cat_cols[0]].astype(str).tolist()
                     series = [df[c].fillna(0).tolist() for c in num_cols]
                     plot_uri = plot_to_base64(labels, series, kind="stacked_bar", title=question)
-
-                # category + 1 numeric (small) → pie
                 elif cat_cols and len(num_cols) == 1 and len(df) <= 12:
                     plot_uri = plot_to_base64(
                         df[cat_cols[0]].astype(str).tolist(),
@@ -1815,8 +1803,6 @@ def handle_general_data_question(question: str, history=None):
                         kind="pie",
                         title=question,
                     )
-
-                # month/time → line
                 elif "month" in df.columns and num_cols:
                     plot_uri = plot_to_base64(
                         df["month"].astype(str).tolist(),
@@ -1824,8 +1810,6 @@ def handle_general_data_question(question: str, history=None):
                         kind="line",
                         title=question,
                     )
-
-                # fallback → bar
                 elif cat_cols and num_cols:
                     plot_uri = plot_to_base64(
                         df[cat_cols[0]].astype(str).tolist(),
@@ -1838,7 +1822,6 @@ def handle_general_data_question(question: str, history=None):
         print("Plot error:", e, traceback.format_exc())
         plot_uri = None
 
-
     # 5.a) Prepare Excel export ONLY as in-memory cache; no file written to disk
     download_url = None
     try:
@@ -1849,41 +1832,36 @@ def handle_general_data_question(question: str, history=None):
         print("Export cache error:", e, traceback.format_exc())
         download_url = None
 
-    # 6) Summarize ONLY if user asked
-    if df_preview.empty:
-        explanation = "No data found for that query."
+    # 6) Let LLM summarize results
+    explanation = ""
+    if not df_preview.empty:
+        preview_rows = df_preview.head(50).to_dict(orient="records")
+        try:
+            prompt = (
+                f"User question: {question}\n"
+                f"SQL used:\n{sql_text}\n\n"
+                f"Result preview (first {min(50, len(preview_rows))} rows, JSON):\n"
+                f"{json.dumps(preview_rows, ensure_ascii=False)}\n\n"
+                f"Please provide:\n"
+                f"1. One short headline-style summary line.\n"
+                f"2. One or two sentences explaining the key points in plain language.\n\n"
+                f"IMPORTANT: Do NOT use LaTeX. If you include formulas, write them in plain text."
+            )
+            resp = client.chat.completions.create(
+                model=CHAT_MODEL,
+                messages=[
+                    {"role": "system", "content": "You are a concise data analyst. Avoid LaTeX; use plain text formulas."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.0,
+                max_tokens=256,
+            )
+            explanation = (resp.choices[0].message.content or "").strip()
+            explanation = strip_latex_math(explanation)
+        except Exception:
+            explanation = f"Here are the results for: {question}"
     else:
-        if user_wants_summary(question):
-            # your existing LLM summarizer block goes here (keep it same)
-            explanation = ""
-            preview_rows = df_preview.head(50).to_dict(orient="records")
-            try:
-                prompt = (
-                    f"User question: {question}\n"
-                    f"SQL used:\n{sql_text}\n\n"
-                    f"Result preview (first {min(50, len(preview_rows))} rows, JSON):\n"
-                    f"{json.dumps(preview_rows, ensure_ascii=False)}\n\n"
-                    f"Please provide:\n"
-                    f"1. One short headline-style summary line.\n"
-                    f"2. One or two sentences explaining the key points in plain language.\n\n"
-                    f"IMPORTANT: Do NOT use LaTeX. If you include formulas, write them in plain text."
-                )
-                resp = client.chat.completions.create(
-                    model=CHAT_MODEL,
-                    messages=[
-                        {"role": "system", "content": "You are a concise data analyst. Avoid LaTeX; use plain text formulas."},
-                        {"role": "user", "content": prompt},
-                    ],
-                    temperature=0.0,
-                    max_tokens=256,
-                )
-                explanation = (resp.choices[0].message.content or "").strip()
-                explanation = strip_latex_math(explanation)
-            except Exception:
-                explanation = f"Here are the results for: {question}"
-        else:
-            explanation = f"Here are the results for: {question} (Ask “summarize” if you want insights.)"
-
+        explanation = "No data found for that query."
 
     result = {
         "reply": explanation,
@@ -1904,7 +1882,6 @@ def handle_general_data_question(question: str, history=None):
         pass
 
     return result
-
 
 # FLASK APP
 # -------------------------------------------------
