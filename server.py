@@ -1,4 +1,4 @@
-
+#Entire Table is taken as default
 # server.py
 import os
 import re
@@ -25,7 +25,7 @@ from sklearn.linear_model import LinearRegression
 # -------------------------------------------------
 load_dotenv()
 
-DEBUG_SQL = True
+DEBUG_SQL = os.getenv("DEBUG_SQL", "false").lower() in ("1", "true", "yes")
 
 TZ = ZoneInfo("Asia/Kolkata")  # user timezone
 
@@ -33,7 +33,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 DUCKDB_FILE = os.getenv("DUCKDB_FILE", "./data/sales.duckdb")
 CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4o-mini")
 PORT = int(os.getenv("PORT", "3000"))
-MAX_ROWS = int(os.getenv("MAX_ROWS", "2000"))
+MAX_ROWS = int(os.getenv("MAX_ROWS", "500"))
 QUERY_CACHE = {}      # { sql_text: { "response": result_dict, "time": timestamp } }
 CACHE_TTL = 30        # cache lifespan in seconds (you can increase to 60 if needed)
 
@@ -83,6 +83,7 @@ SAMPLE_MESSAGES = [
     {"role": "user", "text": "give top 10 product name, their profit , profit rate based on profit rate for 2024", "time": SAMPLE_CHAT_CREATED_AT + 8},
     {"role": "user", "text": "show me the cancellation count for provider spectrum where status = cancelled for august 2025", "time": SAMPLE_CHAT_CREATED_AT + 9},
     {"role": "user", "text": "show me the distinct status values", "time": SAMPLE_CHAT_CREATED_AT + 10},
+    {"role": "user", "text": "show me the top 5 company names based on their profit on 2025 in a pie chart", "time": SAMPLE_CHAT_CREATED_AT + 11}
 ]
 
 SAMPLE_CHAT = {
@@ -1173,7 +1174,14 @@ Technical rules:
 - IMPORTANT: If the user asks for estimate/prediction/forecast/projected values, return NO_SQL.
 - If the question wants raw row details (not aggregation), include LIMIT {MAX_ROWS}, unless the user explicitly asks for "all ...".
 - If the question is purely conceptual/theory (definitions, explanations) without needing actual table values, return NO_SQL.
-
+- If the user asks for a chart, graph, plot, distribution, comparison, or "by <something>":
+  return an aggregated result suitable for visualization.
+  Prefer:
+  • 1 numeric column → histogram
+  • 2 numeric columns → scatter plot
+  • 1 category + 1 numeric → pie or bar
+  • 1 category + multiple numeric columns → stacked bar
+  Do NOT return raw row-level data in these cases.
 Schema:
 {schema_info}
 
@@ -1330,6 +1338,11 @@ def answer_theory_question(question: str):
     except Exception as e:
         _log_and_mask_error(e, "answer_theory_question")
         return _safe_user_error("I couldn't answer that right now. Please try again.")
+def user_wants_summary(question: str) -> bool:
+    q = (question or "").lower().strip()
+    return any(k in q for k in [
+        "summarize", "summary", "explain", "insights", "interpret", "what does this mean"
+    ])
 
 def handle_general_data_question(question: str, history=None):
     """
@@ -1610,7 +1623,7 @@ def handle_general_data_question(question: str, history=None):
 
     try:
         with _get_duck_con() as local_con:
-            sample_rows = local_con.execute(f"SELECT * FROM {TABLE} LIMIT 50").fetchdf()
+            sample_rows = local_con.execute(f"SELECT * FROM {TABLE} LIMIT 10").fetchdf()
     except Exception:
         sample_rows = SAMPLE_DF if not SAMPLE_DF.empty else pd.DataFrame(columns=COLS)
 
@@ -1760,7 +1773,7 @@ def handle_general_data_question(question: str, history=None):
                 series = [df[c].fillna(0).tolist() for c in num_cols]
                 plot_uri = plot_to_base64(labels, series, kind="stacked_bar", title=question)
 
-            elif kind == "pie" and cat_cols and num_cols:
+            elif kind == "pie"and cat_cols and num_cols:
                 labels = df[cat_cols[0]].astype(str).tolist()
                 vals = df[num_cols[0]].fillna(0).tolist()
                 plot_uri = plot_to_base64(labels, vals, kind="pie", title=question)
@@ -1832,36 +1845,40 @@ def handle_general_data_question(question: str, history=None):
         print("Export cache error:", e, traceback.format_exc())
         download_url = None
 
-    # 6) Let LLM summarize results
-    explanation = ""
-    if not df_preview.empty:
-        preview_rows = df_preview.head(50).to_dict(orient="records")
-        try:
-            prompt = (
-                f"User question: {question}\n"
-                f"SQL used:\n{sql_text}\n\n"
-                f"Result preview (first {min(50, len(preview_rows))} rows, JSON):\n"
-                f"{json.dumps(preview_rows, ensure_ascii=False)}\n\n"
-                f"Please provide:\n"
-                f"1. One short headline-style summary line.\n"
-                f"2. One or two sentences explaining the key points in plain language.\n\n"
-                f"IMPORTANT: Do NOT use LaTeX. If you include formulas, write them in plain text."
-            )
-            resp = client.chat.completions.create(
-                model=CHAT_MODEL,
-                messages=[
-                    {"role": "system", "content": "You are a concise data analyst. Avoid LaTeX; use plain text formulas."},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.0,
-                max_tokens=256,
-            )
-            explanation = (resp.choices[0].message.content or "").strip()
-            explanation = strip_latex_math(explanation)
-        except Exception:
-            explanation = f"Here are the results for: {question}"
-    else:
+    # 6) Summarize ONLY if user asked
+    if df_preview.empty:
         explanation = "No data found for that query."
+    else:
+        if user_wants_summary(question):
+            # your existing LLM summarizer block goes here (keep it same)
+            explanation = ""
+            preview_rows = df_preview.head(50).to_dict(orient="records")
+            try:
+                prompt = (
+                    f"User question: {question}\n"
+                    f"SQL used:\n{sql_text}\n\n"
+                    f"Result preview (first {min(50, len(preview_rows))} rows, JSON):\n"
+                    f"{json.dumps(preview_rows, ensure_ascii=False)}\n\n"
+                    f"Please provide:\n"
+                    f"1. One short headline-style summary line.\n"
+                    f"2. One or two sentences explaining the key points in plain language.\n\n"
+                    f"IMPORTANT: Do NOT use LaTeX. If you include formulas, write them in plain text."
+                )
+                resp = client.chat.completions.create(
+                    model=CHAT_MODEL,
+                    messages=[
+                        {"role": "system", "content": "You are a concise data analyst. Avoid LaTeX; use plain text formulas."},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0.0,
+                    max_tokens=256,
+                )
+                explanation = (resp.choices[0].message.content or "").strip()
+                explanation = strip_latex_math(explanation)
+            except Exception:
+                explanation = f"Here are the results for: {question}"
+        else:
+            explanation = f"Here are the results for: {question} (Ask “summarize” if you want insights.)"
 
     result = {
         "reply": explanation,
