@@ -25,7 +25,7 @@ from sklearn.linear_model import LinearRegression
 # -------------------------------------------------
 load_dotenv()
 
-DEBUG_SQL = os.getenv("DEBUG_SQL", "false").lower() in ("1", "true", "yes")
+DEBUG_SQL =True
 
 TZ = ZoneInfo("Asia/Kolkata")  # user timezone
 
@@ -108,6 +108,9 @@ PRED_MESSAGES = [
   {"role":"user","text":"show me the month wise profit rate and estimated profit rate for the product TV for 2025","time":PRED_CHAT_CREATED_AT+4},
   {"role":"user","text":"show month wise revenue for the product tv and also estimate the revenue for 2025","time":PRED_CHAT_CREATED_AT+5},
   {"role":"user","text":"what is the disconnected rate and estimated disconnected rate for the provider comcast for dec 2025.","time":PRED_CHAT_CREATED_AT+6},
+  {"role":"user","text":"show me the installation and estimated installation based on mainchannel wise on 2025","time":PRED_CHAT_CREATED_AT+7},
+  {"role":"user","text":"show me the top 10 product name, profit and estimated profit on 2025","time":PRED_CHAT_CREATED_AT+8},
+  {"role":"user","text":"show me the top 10 provider name, disconnection orders,disconnected rate and estimated disconnection rate on october 2025","time":PRED_CHAT_CREATED_AT+9}
 ]
 
 PRED_CHAT = {"id":PRED_CHAT_ID,"title":PRED_CHAT_TITLE,"created_at":PRED_CHAT_CREATED_AT,"messages":PRED_MESSAGES}
@@ -181,6 +184,10 @@ DETECTED = {
     'revenue': find_best(COLS, REVENUE_CANDS),
     'profit': find_best(COLS, PROFIT_CANDS),
 }
+PACKAGE_CANDS = ["Package", "PackageName", "OrderPackage", "PkgName"]
+DETECTED.update({
+    "package": find_best(COLS, PACKAGE_CANDS),
+})
 
 print("Auto-detected columns:", DETECTED)
 # ---------------------------
@@ -299,7 +306,7 @@ def is_safe_select(sql: str) -> bool:
     forbidden = [
         "INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE", "REPLACE",
         "TRUNCATE", "MERGE", "VACUUM", "ATTACH", "DETACH", "COPY", "EXPORT",
-        "CALL", "EXEC", "EXECUTE"
+        "CALL", "EXEC", "EXECUTE","PRAGMA", "SET", "LOAD", "INSTALL"
     ]
     for w in forbidden:
         if re.search(rf"\b{w}\b", sql_clean, flags=re.IGNORECASE):
@@ -420,7 +427,7 @@ def _extract_key_lookup(question: str):
     # e.g. "orderitemkey 12345"
     token_pat = re.compile(rf"{re.escape(_split_camel(hit_col).lower())}\s+([A-Za-z0-9\-#]{{2,80}})", re.IGNORECASE)
     token_pat2 = re.compile(rf"{re.escape(_norm_key(hit_col))}\s*[:=]?\s*([A-Za-z0-9\-#]{{2,80}})", re.IGNORECASE)
-    mt2 = token_pat2.search(_norm_key(q))
+    mt2 = token_pat2.search(q)  # use original text, not normalized
     if mt2:
         return (hit_col, mt2.group(1).strip(), lim)
 
@@ -505,6 +512,26 @@ _ALIAS_MAP = {
     "providername": ["provider", "provider name", "providername"],
     "productname": ["product", "product name", "productname"],
 }
+_ALIAS_MAP.update({
+  "companyname": ["company", "company name", "companyname", "company_name"],
+  "companykey":  ["company key", "companyid", "company id", "companykey"],
+})
+
+def autodetect_package_col():
+    # strongest: contains "package"
+    for c in COLS:
+        if "package" in _norm_key(c):
+            return c
+    # fallback: contains "bundle"
+    for c in COLS:
+        if "bundle" in _norm_key(c):
+            return c
+    return None
+
+try:
+    DETECTED["package"] = autodetect_package_col()
+except Exception:
+    pass
 
 def resolve_col_name(user_phrase: str):
     """
@@ -526,11 +553,35 @@ def resolve_col_name(user_phrase: str):
     if nk in _COL_VARIANTS_NORM:
         return _COL_VARIANTS_NORM[nk]
 
-    # 3) alias expansion
+    # Package override (works even if column isn't literally named "Package")
+    if _norm_key(raw) in ("package", "packagename", "pkg", "pkgname", "bundle", "bundlename"):
+        pc = DETECTED.get("package")
+        if pc:
+            return pc
+
+    # direct "package" auto-detect override
+    if _norm_key(raw) in ("package", "packagename", "orderpackage", "bundle", "bundlename", "pkg", "pkgname"):
+        pc = DETECTED.get("package")
+        if pc:
+            return pc
+    # 3) alias map (NON-RECURSIVE to avoid infinite loops)
     for k, vals in _ALIAS_MAP.items():
-        if nk == _norm_key(k) or raw == k:
+        k_norm = _norm_key(k)
+        vals_norm = {_norm_key(x) for x in vals}
+
+        # match if user typed the alias key OR any alias value
+        if nk == k_norm or nk in vals_norm or raw in vals:
+            # First try: canonical key itself (e.g., "companyname" -> actual column)
+            col = _COL_VARIANTS_NORM.get(k_norm)
+            if col:
+                return col
+
+            # Second try: each alias value directly (NO recursion)
             for v in vals:
-                col = resolve_col_name(v)  # recurse through variants
+                v_raw = (v or "").strip().lower()
+                v_norm = _norm_key(v_raw)
+
+                col = _COL_VARIANTS.get(v_raw) or _COL_VARIANTS_NORM.get(v_norm)
                 if col:
                     return col
 
@@ -601,32 +652,43 @@ def _month_start_end(year: int, month: int):
 _ENTITY_STOPWORDS = (
     "for|in|on|where|with|month|year|and|or|by|from|to|as|at|of|"
     "what|whats|is|are|was|were|show|give|tell|find|get|calculate|compute|"
+    "name|names|"
     "profit|revenue|rate|orders|order|installation|install|disconnection|disconnect|"
     "estimate|estimated|forecast|predict|predicted|projection|projected"
 )
-
 def extract_provider(question: str):
     q = (question or "").strip()
-    # allow "provider spectrum" or "provider is spectrum" or "provider = spectrum"
+
+    # ONLY treat as a provider filter if user uses an operator:
+    # "provider is X" / "provider = X" / "provider: X"
     m = re.search(
-        r"\bprovider\b\s*(?:is|=|:)?\s*([A-Za-z0-9&._\-/ ]{2,80})",
+        r"\bprovider\b\s*(?:is|=|:)\s*([A-Za-z0-9&._\-/ ]{2,80})",
         q,
         flags=re.IGNORECASE
     )
     if not m:
         return None
+
     val = (m.group(1) or "").strip()
 
     # cut at stopwords
     val = re.split(rf"\b(?:{_ENTITY_STOPWORDS})\b", val, flags=re.IGNORECASE)[0].strip()
-
-    # keep only first chunk before punctuation that often continues sentence
     val = re.split(r"[,.?;!]", val)[0].strip()
+
+    # block junk
+    if val.lower() in ("name", "names"):
+        return None
 
     return val if val else None
 
 def extract_product(question: str):
     q = (question or "").strip()
+    ql = q.lower()
+
+    # If user says "product name" they are usually referring to the column, not a filter value.
+    if re.search(r"\bproduct\s+name\b", ql):
+        return None
+
     # allow "product tv" or "product is tv" or "product = tv"
     m = re.search(
         r"\bproduct\b\s*(?:is|=|:)?\s*([A-Za-z0-9&._\-/ ]{2,80})",
@@ -635,11 +697,16 @@ def extract_product(question: str):
     )
     if not m:
         return None
+
     val = (m.group(1) or "").strip()
 
     # cut at stopwords
     val = re.split(rf"\b(?:{_ENTITY_STOPWORDS})\b", val, flags=re.IGNORECASE)[0].strip()
     val = re.split(r"[,.?;!]", val)[0].strip()
+
+    # block junk values
+    if val.lower() in ("name", "names", "rate", "rates"):
+        return None
 
     return val if val else None
 
@@ -708,12 +775,14 @@ def _extract_generic_filters_anycol(question: str):
             if not (b <= s or a >= e):
                 return True
         return False
-
+    
     # A) operator form: "<col phrase> is/=/: <value>"
     for v in variants:
-        if not v or v not in ql:
+        if not v:
             continue
         v_re = re.escape(v)
+        if not re.search(rf"\b{v_re}\b", ql, flags=re.IGNORECASE):
+            continue
         pat = re.compile(rf"\b{v_re}\b\s*(?:=|:|\bis\b)\s*([A-Za-z0-9&._\-#/ ]{{2,80}})", flags=re.IGNORECASE)
         for m in pat.finditer(q):
             a, b = m.span()
@@ -729,6 +798,30 @@ def _extract_generic_filters_anycol(question: str):
             used_spans.append((a, b))
 
     # B) no-operator form: "for the <col phrase> <value>" OR "<col phrase> <value>"
+# B) no-operator form: "<col phrase> <value>" (simple, 1-3 tokens)
+    for v in variants:
+        if not v:
+            continue
+        v_re = re.escape(v)
+        if not re.search(rf"\b{v_re}\b", ql, flags=re.IGNORECASE):
+            continue
+
+        pat = re.compile(
+            rf"\b{v_re}\b\s+([A-Za-z0-9&._\-#/]+(?:\s+[A-Za-z0-9&._\-#/]+){{0,2}})",
+            flags=re.IGNORECASE
+        )
+        for m in pat.finditer(q):
+            a, b = m.span()
+            if _span_overlaps(a, b):
+                continue
+            col = resolve_col_name(v)
+            if not col:
+                continue
+            val = _clean_value(m.group(1))
+            if not val:
+                continue
+            out.append((col, val))
+            used_spans.append((a, b))
 
     # C) reversed form: "DirecTV package" (keep ONLY for package-ish columns because value-first is risky)
     pkg_col = resolve_col_name("package")
@@ -754,10 +847,123 @@ def _extract_generic_filters_anycol(question: str):
     except Exception:
         pass
     return out
+# -------------------------------------------------
+# GROUP BY + TOP-N detection (Prediction mode)
+# -------------------------------------------------
+def extract_top_n(question: str):
+    """
+    Extracts top N from phrases like:
+      - "top 10"
+      - "top 20 product"
+    Returns int or None
+    """
+    q = (question or "").lower()
+    m = re.search(r"\btop\s+(\d{1,4})\b", q)
+    if not m:
+        return None
+    n = int(m.group(1))
+    n = max(1, min(n, 500))
+    return n
 
-def build_prediction_monthly_sql(question: str):
+def wants_month_wise(question: str) -> bool:
+    q = (question or "").lower()
+    return any(p in q for p in ["month wise", "month-wise", "monthly", "monthwise"])
+
+def extract_groupby_phrase(question: str):
+    q = (question or "").strip()
+
+    def _clean(phrase: str) -> str:
+        if not phrase:
+            return None
+        phrase = phrase.strip()
+        # remove leading prompt fluff
+        phrase = re.sub(r"^(show|give|tell|find|get|display)\s+me\s+(the\s+)?", "", phrase, flags=re.IGNORECASE).strip()
+        # stop at common separators / time / limits
+        phrase = re.split(r"\b(on|in|for|where|with|limit|month|year|wise)\b", phrase, flags=re.IGNORECASE)[0]
+        phrase = re.split(r"\b20\d{2}\b", phrase)[0]
+        return phrase.strip()
+
+    # 1) based on ...
+    m = re.search(r"\bbased\s+on\s+([A-Za-z0-9 _\-/&.]{2,120})", q, flags=re.IGNORECASE)
+    if m:
+        return _clean(m.group(1))
+
+    # 2) by ...
+    m = re.search(r"\bby\s+([A-Za-z0-9 _\-/&.]{2,120})", q, flags=re.IGNORECASE)
+    if m:
+        return _clean(m.group(1))
+
+    # 3) <something> wise  (IMPORTANT: capture only the last phrase before 'wise')
+    m = re.search(r"\b(.{2,200}?)\s+wise\b", q, flags=re.IGNORECASE)
+    if m:
+        left = _clean(m.group(1))
+        if not left:
+            return None
+
+        # take tail tokens (prevents capturing "show me the ...")
+        tokens = left.split()
+        for k in (4, 3, 2, 1):
+            tail = " ".join(tokens[-k:])
+            if tail:
+                return tail
+
+    return None
+def extract_limit(q: str, default=None, max_limit=None):
+    if max_limit is None:
+        max_limit = MAX_ROWS
+    m = re.search(r"\blimit\s+(\d{1,4})\b", q, flags=re.IGNORECASE)
+    if not m:
+        return default
+    n = int(m.group(1))
+    return max(1, min(n, max_limit))
+
+def resolve_group_col(question: str):
+    phrase = extract_groupby_phrase(question)
+
+    # NEW: if no "based on / by / wise", try "top N <dimension>"
+    if not phrase:
+        phrase = extract_groupby_from_top_phrase(question)
+
+    if not phrase:
+        return None
+
+    col = resolve_col_name(phrase)
+    if col and col in COLS:
+        return col
+    return None
+
+def extract_groupby_from_top_phrase(question: str):
+    """
+    Detect patterns like:
+      - "top 10 product name ..."
+      - "top 20 company name ..."
+      - "top 15 package ..."
+    Returns a phrase like "product name" / "company name" etc.
+    """
+    q = (question or "").strip()
+    ql = q.lower()
+
+    m = re.search(r"\btop\s+\d{1,4}\s+([a-z0-9 _\-/&.]{2,60})", ql)
+    if not m:
+        return None
+
+    phrase = (m.group(1) or "").strip()
+
+    # stop phrase early at common metric words
+    phrase = re.split(r"\b(profit|revenue|rate|orders?|installation|disconnection|estimated|estimate)\b", phrase)[0].strip()
+
+    # common cleanup
+    phrase = phrase.replace("wise", "").strip()
+    return phrase if phrase else None
+
+def build_prediction_monthly_sql(question: str, group_col: str = None, sparse_groups: bool = False, limit_n: int = None):
     year = extract_year(question)
     month_year = extract_month_year(question)
+    # limit for grouped outputs (fallback to 50 if not provided)
+    if limit_n is None:
+        limit_n = extract_limit(question, default=50, max_limit=MAX_ROWS)
+    else:
+        limit_n = max(1, min(int(limit_n), MAX_ROWS))
 
     profit_col = get_profit_col() or "Profit"
     revenue_col = get_revenue_col() or "NetAfterChargeback"
@@ -770,6 +976,9 @@ def build_prediction_monthly_sql(question: str):
     product_col  = resolve_col_name("productname")  or "ProductName"
 
     provider = extract_provider(question)
+    # HARD BLOCK: never allow provider filter to be the word "name"
+    if provider and provider.strip().lower() in ("name", "providername", "provider name"):
+        provider = None
     product = extract_product(question)
 
     generic_filters = []
@@ -781,6 +990,7 @@ def build_prediction_monthly_sql(question: str):
     # target range + train range
     if month_year:
         y, m = month_year
+        year = month_year[0]
         target_start, target_end = _month_start_end(y, m)
         train_start = target_start - dtmod.timedelta(days=365)
         date_start = train_start
@@ -819,19 +1029,181 @@ def build_prediction_monthly_sql(question: str):
     months_start = date_start
     months_end = target_end
 
+    # Optional grouping: normalize empty to 'nan'
+    group_enabled = bool(group_col and group_col in COLS)
+
+    group_key_expr = (
+        f"COALESCE(NULLIF(TRIM(CAST({qident(group_col)} AS VARCHAR)),''), 'nan')"
+        if group_enabled else
+        None
+    )
+# -------------------------------------------------
+# months CTE
+# - no group: months only
+# - group + not sparse: months x group_key (cross join)
+# - group + sparse: DO NOT build months_cte (fast-path returns later)
+# -------------------------------------------------
+    months_cte = ""
+
+    if not group_enabled:
+        months_cte = f"""
+    months AS (
+    SELECT STRFTIME('%Y-%m', d) AS month
+    FROM generate_series(
+        DATE '{months_start.isoformat()}',
+        DATE '{(months_end - dtmod.timedelta(days=1)).isoformat()}',
+        INTERVAL '1 month'
+    ) t(d)
+    )
+    """.strip()
+
+    elif group_enabled and (not sparse_groups):
+        months_cte = f"""
+    months AS (
+    SELECT
+        STRFTIME('%Y-%m', d) AS month,
+        g.group_key
+    FROM generate_series(
+        DATE '{months_start.isoformat()}',
+        DATE '{(months_end - dtmod.timedelta(days=1)).isoformat()}',
+        INTERVAL '1 month'
+    ) t(d)
+    JOIN (
+        SELECT DISTINCT {group_key_expr} AS group_key
+        FROM {TABLE}
+        WHERE {where_dim_sql}
+    ) g ON 1=1
+    )
+    """.strip()
+
+    else:
+        # sparse group mode: do not build months_cte; fast-path SQL returns below
+        months_cte = ""
+
+
+    # Add group select fragments for the agg CTEs
+    sale_group_select = f", {group_key_expr} AS group_key" if group_enabled else ""
+    sale_group_by = ", 2" if group_enabled else ""
+
+    inst_group_select = f", {group_key_expr} AS group_key" if group_enabled else ""
+    inst_group_by = ", 2" if group_enabled else ""
+
+    disc_group_select = f", {group_key_expr} AS group_key" if group_enabled else ""
+    disc_group_by = ", 2" if group_enabled else ""
+
+    # Join conditions
+    join_sale = "s.month = m.month" + (" AND s.group_key = m.group_key" if group_enabled else "")
+    join_inst = "i.month = m.month" + (" AND i.group_key = m.group_key" if group_enabled else "")
+    join_disc = "d.month = m.month" + (" AND d.group_key = m.group_key" if group_enabled else "")
+
+    select_group_key = "m.group_key," if group_enabled else ""
+    order_by = "m.month" + (", m.group_key" if group_enabled else "")
+    # ---------------------------------------------
+    # FAST PATH: sparse grouped mode (NO months x groups CROSS JOIN)
+    # IMPORTANT: Must RETURN a "month" column because downstream code filters by df_out["month"]
+    # ---------------------------------------------
+    if group_enabled and sparse_groups:
+        sql = f"""
+        WITH
+        sale_agg AS (
+            SELECT
+            STRFTIME('%Y-%m', TRY_CAST({qident(sale_date_col)} AS DATE)) AS month,
+            {group_key_expr} AS group_key,
+
+            SUM(CASE WHEN COALESCE(ConfirmedOrder,0)=1 THEN 1 ELSE 0 END) AS total_orders,
+            SUM(CASE WHEN COALESCE(InstalledOrder,0)=1 THEN 1 ELSE 0 END) AS installation_orders,
+            SUM(CASE WHEN TRY_CAST({qident(disconnect_date_col)} AS TIMESTAMP) IS NOT NULL THEN 1 ELSE 0 END) AS disconnection_orders,
+
+            SUM(COALESCE({qident(revenue_col)},0)) AS revenue,
+            SUM(COALESCE({qident(profit_col)},0))  AS profit
+            FROM {TABLE}
+            WHERE
+            TRY_CAST({qident(sale_date_col)} AS DATE) >= DATE '{date_start.isoformat()}'
+            AND TRY_CAST({qident(sale_date_col)} AS DATE) <  DATE '{date_end.isoformat()}'
+            AND {where_dim_sql}
+            GROUP BY 1,2
+        ),
+
+        install_agg AS (
+            SELECT
+            STRFTIME('%Y-%m', TRY_CAST({qident(install_date_col)} AS DATE)) AS month,
+            {group_key_expr} AS group_key,
+            COUNT(*) AS installation_count
+            FROM {TABLE}
+            WHERE
+            TRY_CAST({qident(install_date_col)} AS DATE) >= DATE '{date_start.isoformat()}'
+            AND TRY_CAST({qident(install_date_col)} AS DATE) <  DATE '{date_end.isoformat()}'
+            AND {where_dim_sql}
+            GROUP BY 1,2
+        ),
+
+        disc_agg AS (
+            SELECT
+            STRFTIME('%Y-%m', TRY_CAST({qident(disconnect_date_col)} AS DATE)) AS month,
+            {group_key_expr} AS group_key,
+            COUNT(*) AS disconnection_count
+            FROM {TABLE}
+            WHERE
+            TRY_CAST({qident(disconnect_date_col)} AS DATE) >= DATE '{date_start.isoformat()}'
+            AND TRY_CAST({qident(disconnect_date_col)} AS DATE) <  DATE '{date_end.isoformat()}'
+            AND {where_dim_sql}
+            GROUP BY 1,2
+        ),
+
+        base AS (
+            SELECT month, group_key FROM sale_agg
+            UNION
+            SELECT month, group_key FROM install_agg
+            UNION
+            SELECT month, group_key FROM disc_agg
+        )
+
+        SELECT
+        b.month,
+        b.group_key,
+
+        COALESCE(s.total_orders, 0) AS total_orders,
+        COALESCE(s.installation_orders, 0) AS installation_orders,
+        COALESCE(
+            ROUND(COALESCE(s.installation_orders,0) * 100.0 / NULLIF(COALESCE(s.total_orders,0), 0), 2),
+            0
+        ) AS installation_rate,
+
+        COALESCE(s.disconnection_orders, 0) AS disconnection_orders,
+        COALESCE(
+            ROUND(COALESCE(s.disconnection_orders,0) * 100.0 / NULLIF(COALESCE(s.total_orders,0), 0), 2),
+            0
+        ) AS disconnection_rate,
+
+        COALESCE(i.installation_count, 0) AS installation_count,
+        COALESCE(d.disconnection_count, 0) AS disconnection_count,
+
+        COALESCE(s.revenue, 0) AS revenue,
+        COALESCE(s.profit, 0)  AS profit,
+
+        COALESCE(
+            ROUND(COALESCE(s.profit,0) * 100.0 / NULLIF(COALESCE(s.revenue,0), 0), 2),
+            0
+        ) AS profit_rate
+
+        FROM base b
+        LEFT JOIN sale_agg    s ON s.month = b.month AND s.group_key = b.group_key
+        LEFT JOIN install_agg i ON i.month = b.month AND i.group_key = b.group_key
+        LEFT JOIN disc_agg    d ON d.month = b.month AND d.group_key = b.group_key
+        ORDER BY b.month, b.group_key
+        """.strip()
+
+        return sql, target_filter
+
+
     sql = f"""
-WITH months AS (
-  SELECT STRFTIME('%Y-%m', d) AS month
-  FROM generate_series(
-    DATE '{months_start.isoformat()}',
-    DATE '{(months_end - dtmod.timedelta(days=1)).isoformat()}',
-    INTERVAL '1 month'
-  ) t(d)
-),
+WITH
+{months_cte},
 
 sale_agg AS (
   SELECT
-    STRFTIME('%Y-%m', TRY_CAST({qident(sale_date_col)} AS DATE)) AS month,
+    STRFTIME('%Y-%m', TRY_CAST({qident(sale_date_col)} AS DATE)) AS month
+    {sale_group_select},
 
     -- Total orders (confirmed)
     SUM(CASE WHEN COALESCE(ConfirmedOrder,0)=1 THEN 1 ELSE 0 END) AS total_orders,
@@ -851,35 +1223,38 @@ sale_agg AS (
     TRY_CAST({qident(sale_date_col)} AS DATE) >= DATE '{date_start.isoformat()}'
     AND TRY_CAST({qident(sale_date_col)} AS DATE) <  DATE '{date_end.isoformat()}'
     AND {where_dim_sql}
-  GROUP BY 1
+  GROUP BY 1{sale_group_by}
 ),
 
 install_agg AS (
   SELECT
-    STRFTIME('%Y-%m', TRY_CAST({qident(install_date_col)} AS DATE)) AS month,
+    STRFTIME('%Y-%m', TRY_CAST({qident(install_date_col)} AS DATE)) AS month
+    {inst_group_select},
     COUNT(*) AS installation_count
   FROM {TABLE}
   WHERE
     TRY_CAST({qident(install_date_col)} AS DATE) >= DATE '{date_start.isoformat()}'
     AND TRY_CAST({qident(install_date_col)} AS DATE) <  DATE '{date_end.isoformat()}'
     AND {where_dim_sql}
-  GROUP BY 1
+  GROUP BY 1{inst_group_by}
 ),
 
 disc_agg AS (
   SELECT
-    STRFTIME('%Y-%m', TRY_CAST({qident(disconnect_date_col)} AS DATE)) AS month,
+    STRFTIME('%Y-%m', TRY_CAST({qident(disconnect_date_col)} AS DATE)) AS month
+    {disc_group_select},
     COUNT(*) AS disconnection_count
   FROM {TABLE}
   WHERE
     TRY_CAST({qident(disconnect_date_col)} AS DATE) >= DATE '{date_start.isoformat()}'
     AND TRY_CAST({qident(disconnect_date_col)} AS DATE) <  DATE '{date_end.isoformat()}'
     AND {where_dim_sql}
-  GROUP BY 1
+  GROUP BY 1{disc_group_by}
 )
 
 SELECT
   m.month,
+  {select_group_key}
 
   COALESCE(s.total_orders, 0) AS total_orders,
   COALESCE(s.installation_orders, 0) AS installation_orders,
@@ -910,13 +1285,14 @@ SELECT
   ) AS profit_rate
 
 FROM months m
-LEFT JOIN sale_agg    s ON s.month = m.month
-LEFT JOIN install_agg i ON i.month = m.month
-LEFT JOIN disc_agg    d ON d.month = m.month
-ORDER BY m.month
+LEFT JOIN sale_agg    s ON {join_sale}
+LEFT JOIN install_agg i ON {join_inst}
+LEFT JOIN disc_agg    d ON {join_disc}
+ORDER BY {order_by}
 """.strip()
 
     return sql, target_filter
+
 
 def _month_to_index(ym: str) -> int:
     try:
@@ -989,6 +1365,25 @@ def add_estimated_columns(df: pd.DataFrame, cols_to_estimate, window=12, mode: s
 
     df.drop(columns=["__t"], inplace=True, errors="ignore")
     return df
+def add_estimated_columns_grouped(df: pd.DataFrame, group_col_name: str, cols_to_estimate, window=12, mode: str = "always"):
+    """
+    Apply add_estimated_columns() per group so each group gets its own regression model.
+    group_col_name should be "group_key".
+    """
+    if df is None or df.empty:
+        return df
+    if group_col_name not in df.columns:
+        return add_estimated_columns(df, cols_to_estimate, window=window, mode=mode)
+
+    out_parts = []
+    for gval, part in df.groupby(group_col_name, dropna=False):
+        part2 = add_estimated_columns(part, cols_to_estimate, window=window, mode=mode)
+        out_parts.append(part2)
+
+    try:
+        return pd.concat(out_parts, ignore_index=True)
+    except Exception:
+        return df
 
 def add_estimated_rate_columns(df: pd.DataFrame):
     """
@@ -1359,7 +1754,17 @@ def handle_general_data_question(question: str, history=None):
     prediction_mode = is_prediction_request(question)
     if prediction_mode:
         try:
-            pred_sql, target_filter = build_prediction_monthly_sql(question)
+            group_col = resolve_group_col(question)
+            print("DEBUG group_col:", group_col, "phrase:", extract_groupby_phrase(question))
+            top_n = extract_top_n(question)
+            month_wise = wants_month_wise(question)
+            sparse_groups = bool(group_col and (not month_wise))
+            pred_sql, target_filter = build_prediction_monthly_sql(
+                question,
+                group_col=group_col,
+                sparse_groups=sparse_groups,
+                limit_n=extract_limit(question, default=50, max_limit=MAX_ROWS)
+            )
             df = run_sql_and_fetch_df(pred_sql)
 
             ql = (question or "").lower()
@@ -1367,6 +1772,19 @@ def handle_general_data_question(question: str, history=None):
             # normalize wording so estimate detection works consistently
             ql = ql.replace("disconnected rate", "disconnection rate")
             ql = ql.replace("disconnect rate", "disconnection rate")
+            # Normalize "orders" wording -> total_orders
+            ql = re.sub(r"\bestimated\s+orders?\b", "estimated total orders", ql)
+            ql = re.sub(r"\bestimate\s+orders?\b", "estimate total orders", ql)
+            ql = re.sub(r"\bestimated\s+order\b", "estimated total orders", ql)
+            ql = re.sub(r"\bestimate\s+order\b", "estimate total orders", ql)
+            # Normalize shorthand "estimated disconnection/installation" to orders
+            ql = re.sub(r"\bestimat(?:e|ed)\s+disconnection\b", "estimated disconnection orders", ql)
+            ql = re.sub(r"\bestimat(?:e|ed)\s+installation\b", "estimated installation orders", ql)
+
+            # Only normalize bare "order(s)" -> total orders when it's NOT part of
+            # "installation order(s)" or "disconnection order(s)"
+            ql = re.sub(r"(?<!disconnection\s)(?<!installation\s)\borders\b", "total orders", ql)
+            ql = re.sub(r"(?<!disconnection\s)(?<!installation\s)\border\b", "total order", ql)
 
             # -----------------------------
             # IMPORTANT:
@@ -1437,10 +1855,10 @@ def handle_general_data_question(question: str, history=None):
                 pass
 
             window = 12
-
-            # mode="always" computes estimated_* for ALL months using past data,
-            # even when actual values exist (your SQL COALESCE makes them non-null).
-            df2 = add_estimated_columns(df, internal_est, window=window, mode="always")
+            if group_col:
+                df2 = add_estimated_columns_grouped(df, "group_key", internal_est, window=window, mode="always")
+            else:
+                df2 = add_estimated_columns(df, internal_est, window=window, mode="always")
 
             # derive estimated_installation_rate / estimated_disconnection_rate if possible
             df2 = add_estimated_rate_columns(df2)
@@ -1454,6 +1872,137 @@ def handle_general_data_question(question: str, history=None):
             elif isinstance(target_filter, tuple) and target_filter[0] == "year":
                 _, y = target_filter
                 df_out = df_out[df_out["month"].astype(str).str.startswith(f"{y:04d}-")]
+            # Keep a month-wise copy for trend explanation (group-wise tables don't have month)
+            df_trend_source = df_out.copy()
+            # -------------------------------------------------
+            # GROUP-WISE OUTPUT (collapse monthly -> one row per group_key)
+            # -------------------------------------------------
+            if group_col and (not month_wise):
+                # df_out currently has month + group_key + metrics (+ estimated)
+                # Collapse to group_key rows for the target year/month range
+
+                # Ensure numeric
+                def _num(s):
+                    return pd.to_numeric(s, errors="coerce").astype(float)
+
+                # For year mode, pick the last month available per group for estimated rates
+                # (end-of-year estimate behavior)
+                df_out = df_out.copy()
+                df_out["__t"] = df_out["month"].astype(str).apply(_month_to_index)
+
+                agg_rows = []
+
+                for gval, part in df_out.groupby("group_key", dropna=False):
+                    part = part.sort_values("__t")
+
+                    row = {"group_key": gval}
+
+                    # Actual totals
+                    if "installation_orders" in part.columns:
+                        row["installation_orders"] = float(_num(part["installation_orders"]).sum())
+                    if "total_orders" in part.columns:
+                        row["total_orders"] = float(_num(part["total_orders"]).sum())
+                    if "disconnection_orders" in part.columns:
+                        row["disconnection_orders"] = float(_num(part["disconnection_orders"]).sum())
+                    if "revenue" in part.columns:
+                        row["revenue"] = float(_num(part["revenue"]).sum())
+                    if "profit" in part.columns:
+                        row["profit"] = float(_num(part["profit"]).sum())
+
+                    # Actual rates from totals
+                    if "installation_orders" in row and "total_orders" in row:
+                        denom = row.get("total_orders", 0.0)
+                        row["installation_rate"] = round((row["installation_orders"] * 100.0 / denom), 2) if denom else 0.0
+
+                    if "disconnection_orders" in row and "total_orders" in row:
+                        denom = row.get("total_orders", 0.0)
+                        row["disconnection_rate"] = round((row["disconnection_orders"] * 100.0 / denom), 2) if denom else 0.0
+
+                    if "profit" in row and "revenue" in row:
+                        denom = row.get("revenue", 0.0)
+                        row["profit_rate"] = round((row["profit"] * 100.0 / denom), 2) if denom else 0.0
+
+                    # Estimated value metrics: SUM across months in target period
+                    if "estimated_revenue" in part.columns:
+                        row["estimated_revenue"] = float(_num(part["estimated_revenue"]).sum())
+                    if "estimated_profit" in part.columns:
+                        row["estimated_profit"] = float(_num(part["estimated_profit"]).sum())
+                    if "estimated_total_orders" in part.columns:
+                        row["estimated_total_orders"] = float(_num(part["estimated_total_orders"]).sum())
+                    if "estimated_installation_orders" in part.columns:
+                        row["estimated_installation_orders"] = float(_num(part["estimated_installation_orders"]).sum())
+                    if "estimated_disconnection_orders" in part.columns:
+                        row["estimated_disconnection_orders"] = float(_num(part["estimated_disconnection_orders"]).sum())
+
+                    # Estimated rates: take last month estimate available (end-of-period)
+                    def _last_valid(colname):
+                        if colname not in part.columns:
+                            return None
+                        v = _num(part[colname]).replace([np.inf, -np.inf], np.nan).dropna()
+                        if len(v) == 0:
+                            return None
+                        # align with last rows: use last non-null in sorted time
+                        vv = pd.to_numeric(part[colname], errors="coerce")
+                        vv = vv.replace([np.inf, -np.inf], np.nan)
+                        # pick last non-null in time order
+                        for x in reversed(list(vv.values)):
+                            if np.isfinite(x):
+                                return float(x)
+                        return None
+
+                    if "estimated_installation_rate" in part.columns:
+                        lv = _last_valid("estimated_installation_rate")
+                        if lv is not None:
+                            row["estimated_installation_rate"] = round(lv, 2)
+
+                    if "estimated_disconnection_rate" in part.columns:
+                        lv = _last_valid("estimated_disconnection_rate")
+                        if lv is not None:
+                            row["estimated_disconnection_rate"] = round(lv, 2)
+
+                    if "estimated_profit_rate" in part.columns:
+                        lv = _last_valid("estimated_profit_rate")
+                        if lv is not None:
+                            row["estimated_profit_rate"] = round(lv, 2)
+
+                    agg_rows.append(row)
+
+                df_group = pd.DataFrame(agg_rows)
+
+                # Decide sorting for TOP N
+                sort_col = None
+                if "profit" in df_group.columns:
+                    sort_col = "profit"
+                elif "revenue" in df_group.columns:
+                    sort_col = "revenue"
+                elif "installation_orders" in df_group.columns:
+                    sort_col = "installation_orders"
+                elif "total_orders" in df_group.columns:
+                    sort_col = "total_orders"
+                elif "installation_rate" in df_group.columns:
+                    sort_col = "installation_rate"
+                elif "profit_rate" in df_group.columns:
+                    sort_col = "profit_rate"
+
+                if sort_col:
+                    df_group = df_group.sort_values(sort_col, ascending=False)
+
+                # Apply top N if asked
+                if top_n:
+                    df_group = df_group.head(int(top_n))
+                # ✅ ALSO apply "limit N" (your current bug: limit is not applied in prediction mode)
+                req_limit = extract_limit(question, default=None, max_limit=MAX_ROWS)
+                if req_limit:
+                    df_group = df_group.head(int(req_limit))
+                # total_orders is useful for "orders" requests; hide only if user did not ask for it
+                q_norm = (question or "").lower()
+                asked_orders = bool(re.search(r"\b(total\s+orders?|orders?)\b", q_norm))
+                asked_est_orders = bool(re.search(r"\bestimat(?:e|ed)\s+(total\s+orders?|orders?)\b", q_norm))
+
+                if "total_orders" in df_group.columns and not (asked_orders or asked_est_orders):
+                    df_group = df_group.drop(columns=["total_orders"], errors="ignore")
+
+                df_out = df_group
 
             if df_out is None or df_out.empty:
                 debug_hint = (
@@ -1474,6 +2023,9 @@ def handle_general_data_question(question: str, history=None):
 
             wants_install_orders = any(p in ql for p in ["installation order", "installation orders", "installed order", "installed orders"])
             wants_install_rate = any(p in ql for p in ["installation rate", "install rate"])
+            # If user asked "installation, installation rate" treat "installation" as installation_orders too
+            if re.search(r"\binstallation\b", ql) and ("installation rate" in ql) and not wants_install_orders:
+                wants_install_orders = True
 
             # "installation" (alone) should behave like installation_orders
             if _wants_installation_wording(ql):
@@ -1488,7 +2040,13 @@ def handle_general_data_question(question: str, history=None):
             asked_profit_explicit = bool(re.search(r"\bprofit\b\s*(?:,|and|&)", ql)) or bool(re.search(r"(?:,|and|&)\s*profit\b", ql))
             wants_profit = asked_profit_explicit or (bool(re.search(r"\bprofit\b", ql)) and not wants_profit_rate)
 
-            base_cols = ["month"]
+            # Base columns depend on output shape
+            base_cols = []
+            if "month" in df_out.columns:
+                base_cols.append("month")
+            if "group_key" in df_out.columns:
+                base_cols.append("group_key")
+
 
             # total orders (only if asked OR if user explicitly requested its estimate)
             if wants_total_orders or ("total_orders" in visible_est):
@@ -1527,10 +2085,11 @@ def handle_general_data_question(question: str, history=None):
                     base_cols += ["estimated_revenue"]
 
             # profit (only if asked OR estimate requested)
-            if (wants_profit and not wants_profit_rate) or ("profit" in visible_est):
+            if wants_profit or ("profit" in visible_est):
                 base_cols += ["profit"]
                 if "profit" in visible_est and "estimated_profit" in df_out.columns:
                     base_cols += ["estimated_profit"]
+
 
             # profit rate (only if asked OR estimate requested)
             if wants_profit_rate or ("profit_rate" in visible_est):
@@ -1551,8 +2110,8 @@ def handle_general_data_question(question: str, history=None):
 
             table_html = rows_to_html_table(df_out.to_dict(orient="records")) if not df_out.empty else "<p><i>No data</i></p>"
 
-            # Trend lines ONLY for what the user asked to estimate (visible_est)
-            reply_text = build_prediction_reply(df_out, visible_est, window=window)
+            trend_df = df_trend_source if (group_col and (not month_wise)) else df_out
+            reply_text = build_prediction_reply(trend_df, visible_est, window=window)
 
             result = {
                 "reply": reply_text,
@@ -1665,6 +2224,9 @@ def handle_general_data_question(question: str, history=None):
     # 2) If NO_SQL → theory/general mode (conversation-aware)
     if not sql_text or sql_text.strip().upper() == "NO_SQL":
         return answer_theory_question(augmented_question)
+    user_limit = extract_limit(question, default=None, max_limit=MAX_ROWS)
+    if user_limit and not re.search(r"\blimit\b", sql_text, flags=re.IGNORECASE):
+        sql_text = sql_text.rstrip().rstrip(";") + f"\nLIMIT {int(user_limit)}"
 
     cache_key = sql_text.strip()
     cached = QUERY_CACHE.get(cache_key)
@@ -1839,8 +2401,9 @@ def handle_general_data_question(question: str, history=None):
     download_url = None
     try:
         file_id = uuid.uuid4().hex
-        EXPORT_CACHE[file_id] = df_preview
+        EXPORT_CACHE[file_id] = {"sid": getattr(g, "sid", ""), "df": df_preview}
         download_url = f"/download/{file_id}"
+
     except Exception as e:
         print("Export cache error:", e, traceback.format_exc())
         download_url = None
@@ -1968,6 +2531,7 @@ def index():
 def chat():
     payload = request.json or {}
     question = (payload.get('message') or "").strip()
+
     history = payload.get('history') or []
     if not question:
         return jsonify({"error": "No message provided"}), 400
@@ -2071,6 +2635,13 @@ def download_result(token):
     data = EXPORT_CACHE.get(token)
     if data is None:
         return "File not found or expired", 404
+
+    # session bind
+    expected_sid = (data.get("sid") or "")
+    if expected_sid and expected_sid != getattr(g, "sid", ""):
+        return "File not found or expired", 404
+
+    data = data.get("df")
 
     output = BytesIO()
 
