@@ -25,7 +25,7 @@ from sklearn.linear_model import LinearRegression
 # -------------------------------------------------
 load_dotenv()
 
-DEBUG_SQL =os.getenv("DEBUG_SQL", "false").lower() in ("1", "true", "yes")
+DEBUG_SQL =True
 
 TZ = ZoneInfo("Asia/Kolkata")  # user timezone
 
@@ -1499,8 +1499,8 @@ def ask_model_for_sql(question: str, schema_cols: list, sample_rows: pd.DataFram
 
         semantic_lines.append(
             "- IMPORTANT DEFINITIONS (use these exactly):\n"
-            "  • Total Orders = SUM(CASE WHEN COALESCE(ConfirmedOrder,0)=1 THEN 1 ELSE 0 END)\n"
-            "  • Installation Orders = SUM(CASE WHEN COALESCE(InstalledOrder,0)=1 THEN 1 ELSE 0 END)\n"
+            "  • Total Orders = COUNT(OrderId)\n"
+            "  • Installation Orders = SUM(InstalledOrder)\n"
             "  • Installation Rate = Installation Orders / Total Orders\n"
             f"  • Disconnection Orders = SUM(CASE WHEN {disconnect_date_col} IS NOT NULL THEN 1 ELSE 0 END)\n"
             "  • Disconnection Rate = Disconnection Orders / Total Orders\n"
@@ -3005,4 +3005,3 @@ if __name__ == "__main__":
         print("Route print failed:", e)
 
     app.run(host="0.0.0.0", port=PORT)
-
