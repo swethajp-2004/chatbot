@@ -516,6 +516,10 @@ _ALIAS_MAP.update({
   "companyname": ["company", "company name", "companyname", "company_name"],
   "companykey":  ["company key", "companyid", "company id", "companykey"],
 })
+_ALIAS_MAP.update({
+    "account": ["account", "account number", "account#", "acct", "acct number"],
+    "orderid": ["orderid", "order id", "order#", "order number"],
+})
 
 def autodetect_package_col():
     # strongest: contains "package"
@@ -680,6 +684,49 @@ def extract_provider(question: str):
         return None
 
     return val if val else None
+def is_bare_id_message(text: str) -> bool:
+    """
+    True if user message is basically just an ID like:
+    19876
+    1,722,757
+    #8260130077300575
+    """
+    if not text:
+        return False
+    t = text.strip()
+    t = t.replace(",", "")
+    # allow optional leading '#'
+    return bool(re.fullmatch(r"#?\d{4,20}", t))
+
+
+def _find_last_details_type(history):
+    """
+    Returns:
+      "account" if last details request was for account
+      "order"   if last details request was for order
+      None      if not found
+    """
+    if not history:
+        return None
+
+    for m in reversed(history):
+        txt = (m.get("content") or m.get("text") or "").lower().strip()
+        if not txt:
+            continue
+
+        # only consider previous turns that were clearly "details" intent
+        if "detail" not in txt and "report" not in txt:
+            continue
+
+        # if they said account in that request -> account
+        if "account" in txt or "acct" in txt:
+            return "account"
+
+        # if they said order in that request -> order
+        if "order" in txt:
+            return "order"
+
+    return None
 
 def extract_product(question: str):
     q = (question or "").strip()
@@ -908,6 +955,111 @@ def extract_groupby_phrase(question: str):
                 return tail
 
     return None
+# -------------------------------------------------
+# DETAILS REPORT (OrderId / Account)
+# -------------------------------------------------
+DETAILS_KEYWORDS = (
+    "details", "detail", "full report", "order report", "account report"
+)
+
+def is_details_request(question: str) -> bool:
+    q = (question or "").lower()
+
+    # must contain details keyword OR must look like specific order/account id lookup
+    if any(k in q for k in DETAILS_KEYWORDS):
+        # BUT block "any 5 account numbers" type queries
+        if re.search(r"\b(any|give me)\s+\d+\s+account", q):
+            return False
+        if re.search(r"\b(any|give me)\s+\d+\s+order", q):
+            return False
+        return True
+# block sample/list requests
+    if re.search(r"\b(any|give me|show me)\s+\d+\s+(account|order)\b", q):
+        return False
+
+    # order id pattern
+    if re.search(r"\border\s*(?:id)?\b\s*#?\s*[\d,]{4,15}\b", q):
+        return True
+
+    # account pattern (requires account/acct word)
+    if re.search(r"\b(account|acct)\b\s*(?:number)?\b\s*#?\s*[a-z0-9\-]{4,30}\b", q):
+        return True
+
+    return False
+
+def extract_account_number(question: str):
+    q = (question or "").strip()
+
+    # block list/sample requests
+    if re.search(r"\b(any|give me|show me)\s+\d+\s+account", q, flags=re.IGNORECASE):
+        return None
+
+    # require digits in the captured value (accounts are numeric in your data)
+    m = re.search(
+        r"\b(account|acct)\b\s*(?:number)?\s*#?\s*([0-9][0-9,\- ]{3,30})",
+        q,
+        flags=re.IGNORECASE
+    )
+    if not m:
+        return None
+
+    acc = (m.group(2) or "").strip()
+    acc = acc.replace(",", "").replace(" ", "")
+    acc = acc.lstrip("#").strip()
+
+    # final safety: must contain at least 4 digits
+    digits_only = re.sub(r"\D", "", acc)
+    if len(digits_only) < 4:
+        return None
+
+    return acc
+
+
+def extract_order_id(question: str):
+    q = (question or "")
+
+    # allow commas: 1,206,911
+    m = re.search(r"\border\s*id\b\s*#?\s*([\d,]{4,15})\b", q, flags=re.IGNORECASE)
+    if not m:
+        m = re.search(r"\borderid\b\s*#?\s*([\d,]{4,15})\b", q, flags=re.IGNORECASE)
+    if not m:
+        m = re.search(r"\border\b\s*#?\s*([\d,]{4,15})\b", q, flags=re.IGNORECASE)
+
+    if not m:
+        return None
+
+    oid = (m.group(1) or "").replace(",", "").strip()
+    return oid if oid.isdigit() else None
+
+def build_details_sql(order_id: str = None, account: str = None):
+    """
+    Fetch ALL rows for a single order_id or account.
+    Keep it deterministic; no LLM.
+    """
+    where = None
+    if order_id:
+        order_id = str(order_id).replace(",", "").strip()
+        where = f"CAST({qident('OrderId')} AS BIGINT) = {int(order_id)}" if "OrderId" in COLS else None
+
+    elif account:
+        account_col = resolve_col_name("account") or ("Account" if "Account" in COLS else None)
+        if account_col:
+            clean_acc = re.sub(r"[^A-Za-z0-9\-]", "", account or "")
+            where = f"""
+            REPLACE(LOWER(TRIM(CAST({qident(account_col)} AS VARCHAR))), '#', '')
+            = LOWER(TRIM({_safe_sql_literal(clean_acc)}))
+            """.strip()
+    if not where:
+        return None
+
+    # No LIMIT: user wants full report for that key (but safe because single key)
+    sql = f"""
+    SELECT *
+    FROM {TABLE}
+    WHERE {where}
+    """.strip()
+    return sql
+
 def extract_limit(q: str, default=None, max_limit=None):
     if max_limit is None:
         max_limit = MAX_ROWS
@@ -1738,6 +1890,237 @@ def user_wants_summary(question: str) -> bool:
     return any(k in q for k in [
         "summarize", "summary", "explain", "insights", "interpret", "what does this mean"
     ])
+def _first_non_null(series):
+    try:
+        for x in series:
+            if pd.notna(x) and str(x).strip().lower() not in ("", "nan", "nat", "none"):
+                return x
+    except Exception:
+        pass
+    return None
+
+def build_order_or_account_report(df: pd.DataFrame, question: str) -> dict:
+    """
+    Returns:
+      reply (markdown-ish text),
+      table_html (structured mini tables),
+      plot_data_uri (optional bar chart),
+    """
+    if df is None or df.empty:
+        return {
+            "reply": "No matching rows found for that Order ID / Account number.",
+            "table_html": "<p><i>No data</i></p>",
+            "plot_data_uri": None,
+        }
+
+    df = df.copy()
+
+    # normalize columns used in report
+    col_orderid = "OrderId" if "OrderId" in df.columns else None
+    col_account = "Account" if "Account" in df.columns else resolve_col_name("account")
+    col_company = "CompanyName" if "CompanyName" in df.columns else None
+    col_created = "CreatedByName" if "CreatedByName" in df.columns else None
+    col_salesrep = "SalesRepName" if "SalesRepName" in df.columns else None
+    col_provider = "ProviderName" if "ProviderName" in df.columns else None
+    cust_first = "CustomerFirstName" if "CustomerFirstName" in df.columns else None
+    cust_last  = "CustomerLastName" if "CustomerLastName" in df.columns else None
+    col_msource = "MarketingSource" if "MarketingSource" in df.columns else None
+
+    sale_col = get_sale_date_col()
+    inst_col = get_install_date_col()
+    disc_col = get_disconnect_date_col()
+
+    col_status = "Status" if "Status" in df.columns else None
+    col_product = "ProductName" if "ProductName" in df.columns else None
+    col_ordertype = "OrderType" if "OrderType" in df.columns else None
+    col_package = DETECTED.get("package") if DETECTED.get("package") in df.columns else ("Package" if "Package" in df.columns else None)
+    col_addon = "Addon" if "Addon" in df.columns else None
+
+    comm_est = "EstimatedCommission" if "EstimatedCommission" in df.columns else None
+    comm_recv = "ReceivedCommission" if "ReceivedCommission" in df.columns else None
+    spend_ads = None
+
+    revenue_col = get_revenue_col()
+    profit_col = get_profit_col()
+
+    # Dedup common duplicates (like repeated EERO SECURE rows)
+    subset = [c for c in [col_orderid, col_account, col_product, col_ordertype, col_package, col_addon, col_status, inst_col, disc_col, comm_est, comm_recv, revenue_col, profit_col] if c]
+    if subset:
+        df = df.drop_duplicates(subset=subset, keep="first")
+
+    # Header values
+    order_id_val = _first_non_null(df[col_orderid]) if col_orderid else None
+    account_val  = _first_non_null(df[col_account]) if col_account and col_account in df.columns else None
+    company_val  = _first_non_null(df[col_company]) if col_company else None
+    provider_val = _first_non_null(df[col_provider]) if col_provider else None
+    created_val  = _first_non_null(df[col_created]) if col_created else None
+    salesrep_val = _first_non_null(df[col_salesrep]) if col_salesrep else None
+    customer_name_val = None
+    if cust_first or cust_last:
+        fn = _first_non_null(df[cust_first]) if cust_first else None
+        ln = _first_non_null(df[cust_last]) if cust_last else None
+        customer_name_val = " ".join([str(x).strip() for x in [fn, ln] if x and str(x).strip().lower() not in ("nan","none","nat")]).strip() or None
+
+    msource_val = _first_non_null(df[col_msource]) if col_msource else None
+
+    sale_val = _first_non_null(df[sale_col]) if sale_col and sale_col in df.columns else None
+    inst_val = _first_non_null(df[inst_col]) if inst_col and inst_col in df.columns else None
+    disc_val = _first_non_null(df[disc_col]) if disc_col and disc_col in df.columns else None
+
+    # Package status table
+    status_rows = []
+    for _, r in df.iterrows():
+        status_rows.append({
+            "Product": r.get(col_product, "") if col_product else "",
+            "Order Type": r.get(col_ordertype, "") if col_ordertype else "",
+            "Package": r.get(col_package, "") if col_package else "",
+            "Addon?": r.get(col_addon, "") if col_addon else "",
+            "Status": r.get(col_status, "") if col_status else "",
+            "Install Date": r.get(inst_col, "") if inst_col else "",
+            "Disconnect Date": r.get(disc_col, "") if disc_col else "",
+        })
+    status_df = pd.DataFrame(status_rows)
+    if "Status" not in status_df.columns:
+        status_df["Status"] = ""
+    if "Package" not in status_df.columns:
+        status_df["Package"] = ""
+
+    # installation/disconnection summary logic
+    installed_mask = status_df["Status"].astype(str).str.lower().str.contains("install")
+    disconnected_mask = status_df["Status"].astype(str).str.lower().str.contains("disconnect")
+
+    installed_pkgs = status_df.loc[installed_mask, "Package"].dropna().astype(str).tolist()
+    disconnected_pkgs = status_df.loc[disconnected_mask, "Package"].dropna().astype(str).tolist()
+    not_installed_pkgs = status_df.loc[~installed_mask, "Package"].dropna().astype(str).tolist()
+
+    # Financials product-wise
+    fin = df.copy()
+    for c in [comm_est, comm_recv, spend_ads, revenue_col, profit_col]:
+        if c and c in fin.columns:
+            fin[c] = pd.to_numeric(fin[c], errors="coerce").fillna(0.0)
+    # ✅ ADD THIS BLOCK RIGHT HERE (before groupby)
+    if col_package and col_package in fin.columns:
+        fin[col_package] = fin[col_package].astype(str).replace(["nan", "None", "NaT"], "").str.strip()
+        fin.loc[fin[col_package] == "", col_package] = "Unknown"
+    group_cols = [c for c in [col_package] if c]
+    if group_cols:
+        agg = { }
+        if comm_est:   agg[comm_est] = "sum"
+        if comm_recv:  agg[comm_recv] = "sum"
+        if spend_ads:  agg[spend_ads] = "sum"
+        if revenue_col: agg[revenue_col] = "sum"
+        if profit_col:  agg[profit_col] = "sum"
+
+        fin_prod = fin.groupby(group_cols, dropna=False).agg(agg).reset_index()
+        fin_prod = fin_prod.rename(columns={
+            col_package: "Package",   # ✅ correct
+            comm_est: "Est. Commission",
+            comm_recv: "Received Commission",
+            revenue_col: "Revenue",
+            profit_col: "Profit"
+        })
+
+    else:
+        fin_prod = pd.DataFrame()
+
+    # totals
+    total_profit = float(fin[profit_col].sum()) if profit_col else None
+    total_rev = float(fin[revenue_col].sum()) if revenue_col else None
+    total_est_comm = float(fin[comm_est].sum()) if comm_est else None
+
+    # Header table HTML (simple key-value)
+    header_pairs = [
+        ("Order ID", order_id_val),
+        ("Account #", account_val),
+        ("Company", company_val),
+        ("Customer Name", customer_name_val),          # ✅ added
+        ("Marketing Source", msource_val), 
+        ("Provider", provider_val),
+        ("Created By", created_val),
+        ("Sales Rep", salesrep_val),
+        ("Sale Date", sale_val),
+        ("Install Date", inst_val),
+        ("Disconnect Date", disc_val),
+    ]
+    header_html = "<table class='table' style='width:100%; border-collapse:collapse;'>"
+    for k, v in header_pairs:
+        if v is None or str(v).strip().lower() in ("", "nan", "nat", "none"):
+            v = "-"
+        header_html += f"<tr><td style='padding:6px; font-weight:600; width:180px;'>{escape(str(k))}</td><td style='padding:6px;'>{escape(str(v))}</td></tr>"
+    header_html += "</table>"
+
+    # Build a neat reply text (what users read first)
+    lines = []
+    lines.append(f"**Order Report**")
+    if order_id_val is not None:
+        lines.append(f"- Order ID: **{order_id_val}**")
+    if account_val is not None:
+        lines.append(f"- Account: **{account_val}**")
+    if company_val:
+        lines.append(f"- Company: **{company_val}**")
+    if provider_val:
+        lines.append(f"- Provider: **{provider_val}**")
+    # package summary
+    if len(not_installed_pkgs) == 0 and len(status_df) > 0:
+        lines.append(f"- Installation: **All packages installed** (Install date: {inst_val or '-'})")
+    else:
+        if installed_pkgs:
+            lines.append(f"- Installed packages: {', '.join(installed_pkgs[:8])}" + (" ..." if len(installed_pkgs) > 8 else ""))
+        if not_installed_pkgs:
+            lines.append(f"- Not installed / ordered only: {', '.join(not_installed_pkgs[:8])}" + (" ..." if len(not_installed_pkgs) > 8 else ""))
+
+    if disconnected_pkgs:
+        lines.append(f"- Disconnected packages: {', '.join(disconnected_pkgs[:8])}" + (" ..." if len(disconnected_pkgs) > 8 else ""))
+        lines.append(f"  (Disconnected date shown in table)")
+
+    # money summary
+    money_bits = []
+    if total_est_comm is not None:
+        money_bits.append(f"Est. Commission: {round(total_est_comm, 2)}")
+    if total_rev is not None:
+        money_bits.append(f"Revenue: {round(total_rev, 2)}")
+    if total_profit is not None:
+        money_bits.append(f"Profit: {round(total_profit, 2)}")
+    if money_bits:
+        lines.append("- Financials: " + " | ".join(money_bits))
+
+    # Add-ons list
+    addons_list = []
+    if col_addon and col_addon in df.columns:
+        addons_list = sorted({str(x) for x in df[col_addon].dropna().unique() if str(x).strip().lower() not in ("", "nan")})
+    if addons_list:
+        lines.append(f"- Add-ons: {', '.join(addons_list[:10])}" + (" ..." if len(addons_list) > 10 else ""))
+
+    reply = "\u200b"  # zero-width space: looks empty, but prevents UI showing "(no reply)"
+
+    # Make status table + financial table HTML
+    status_html = "<h4 style='margin:12px 0 6px;'>Packages & Status</h4>" + rows_to_html_table(status_df.to_dict(orient="records"))
+    fin_html = ""
+    if not fin_prod.empty:
+        fin_html = "<h4 style='margin:12px 0 6px;'>Package-wise Financials</h4>" + rows_to_html_table(fin_prod.to_dict(orient="records"))
+
+    table_html = (
+        "<h4 style='margin:0 0 6px;'>Summary</h4>"
+        + header_html
+        + status_html
+        + fin_html
+    )
+
+    # Optional chart: product-wise profit (bar)
+    plot_uri = None
+    try:
+        if not fin_prod.empty and "Profit" in fin_prod.columns:
+            labels = fin_prod["Package"].astype(str).tolist()
+            vals = pd.to_numeric(fin_prod["Profit"], errors="coerce").fillna(0).tolist()
+            plot_uri = plot_to_base64(labels, vals, kind="bar", title="Profit by Package")
+    except Exception:
+        plot_uri = None
+
+    return {
+        "reply": reply,
+        "table_html": table_html,
+        "plot_data_uri": plot_uri,
+    }
 
 def handle_general_data_question(question: str, history=None):
     """
@@ -1748,26 +2131,37 @@ def handle_general_data_question(question: str, history=None):
     """
     schema_cols = COLS
     qlow = (question or "").lower()
+    history = history or []
+    resolved_question = question
+    if history:
+        # take last few user turns and append (keeps it simple but effective)
+        ctx = []
+        for m in history[-6:]:
+            t = (m.get("content") or m.get("text") or "").strip()
+            if t:
+                ctx.append(t)
+        resolved_question = " | ".join(ctx + [resolved_question])
+
 # -------------------------------------------------
 # PREDICTION MODE (bypass LLM SQL and do stable month-wise SQL + ML)
 # -------------------------------------------------
-    prediction_mode = is_prediction_request(question)
+    prediction_mode = is_prediction_request(resolved_question)
     if prediction_mode:
         try:
-            group_col = resolve_group_col(question)
-            print("DEBUG group_col:", group_col, "phrase:", extract_groupby_phrase(question))
-            top_n = extract_top_n(question)
-            month_wise = wants_month_wise(question)
+            group_col = resolve_group_col(resolved_question)
+            print("DEBUG group_col:", group_col, "phrase:", extract_groupby_phrase(resolved_question))
+            top_n = extract_top_n(resolved_question)
+            month_wise = wants_month_wise(resolved_question)
             sparse_groups = bool(group_col and (not month_wise))
             pred_sql, target_filter = build_prediction_monthly_sql(
-                question,
+                resolved_question,
                 group_col=group_col,
                 sparse_groups=sparse_groups,
-                limit_n=extract_limit(question, default=50, max_limit=MAX_ROWS)
+                limit_n=extract_limit(resolved_question, default=50, max_limit=MAX_ROWS)
             )
             df = run_sql_and_fetch_df(pred_sql)
 
-            ql = (question or "").lower()
+            ql = (resolved_question or "").lower()
 
             # normalize wording so estimate detection works consistently
             ql = ql.replace("disconnected rate", "disconnection rate")
@@ -2142,7 +2536,7 @@ def handle_general_data_question(question: str, history=None):
         ctx_lines = []
         for m in history[-6:]:
             role = m.get("role", "").upper()
-            content = (m.get("content") or "").strip()
+            content = (m.get("content") or m.get("text") or "").strip()
             if content:
                 ctx_lines.append(f"{role}: {content}")
         context_block = "\n".join(ctx_lines)
@@ -2217,6 +2611,68 @@ def handle_general_data_question(question: str, history=None):
         if DEBUG_SQL:
             result["debug_sql"] = sql_text
         return result
+    # -------------------------------------------------
+    # DETAILS REPORT OVERRIDE (OrderId / Account)
+    # -------------------------------------------------
+    def _find_last_order_or_account(history):
+        if not history:
+            return (None, None)
+
+        # scan backward
+        for m in reversed(history):
+            txt = (m.get("content") or m.get("text") or "").strip()
+            if not txt:
+                continue
+            oid = extract_order_id(txt)
+            acc = extract_account_number(txt)
+            if oid or acc:
+                return (oid, acc)
+        return (None, None)
+    # ---------------------------
+    if is_details_request(question) or is_bare_id_message(question):
+        oid = extract_order_id(question)
+        acc = extract_account_number(question)
+
+        # ✅ If user typed ONLY a number, infer whether it's account/order from history
+        if not (oid or acc) and is_bare_id_message(question):
+            last_type = _find_last_details_type(history)
+
+            bare = question.strip().replace(",", "")
+            bare = bare.lstrip("#").strip()
+
+            if last_type == "account":
+                acc = bare
+            elif last_type == "order":
+                oid = bare
+            else:
+                # fallback: treat as order id (or you can choose account)
+                oid = bare
+
+        # ✅ If user said "yes give details" etc (no id), fall back to last id in history
+        if not (oid or acc):
+            oid2, acc2 = _find_last_order_or_account(history)
+            oid = oid or oid2
+            acc = acc or acc2
+
+        if oid or acc:
+            details_sql = build_details_sql(order_id=oid, account=acc)
+            if details_sql:
+                df_details = run_sql_and_fetch_df(details_sql)
+                df_details = apply_hidden_cols_policy(df_details, question)
+
+                report = build_order_or_account_report(df_details, question)
+
+                result = {
+                    "reply": report["reply"],
+                    "table_html": report["table_html"],
+                    "plot_data_uri": report.get("plot_data_uri"),
+                    "rows_returned": int(len(df_details)),
+                    "truncated": False,
+                    "download_url": None,
+                }
+                if DEBUG_SQL:
+                    result["debug_sql"] = details_sql
+                return result
 
     # 1) Ask model for SQL  (conversation-aware)
     sql_text = ask_model_for_sql(augmented_question, schema_cols, sample_rows)
